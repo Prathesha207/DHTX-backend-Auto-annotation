@@ -35,6 +35,21 @@ async def lifespan(app: FastAPI):
     from app.services.websocket_manager import manager
     manager.set_loop(asyncio.get_running_loop())   # ADD — fixes the crash
 
+    from app.services.model_manager import ModelManager
+    from pathlib import Path
+    
+    BASE_DIR = Path(__file__).resolve().parents[1]
+    MODEL_DIR = BASE_DIR / "models" / "ml"
+    
+    # Initialize and load models once at startup
+    model_manager = ModelManager.get_instance()
+    model_manager.load_models(
+        seg_model_path=str(MODEL_DIR / "best_model_finetuned_manual.pth"),
+        yolo_socket_path=str(MODEL_DIR / "best.pt"),
+        pose_model_path=str(MODEL_DIR / "yolov8n-pose.pt")
+    )
+
+
     print("=" * 60)
     print("SQLite database initialized.")
     yield

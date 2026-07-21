@@ -39,6 +39,7 @@ class ExcelParser:
         *,
         video_run_id: int,
         excel_path: str,
+        video_filename: str = None,
     ) -> List:
 
         excel_path = Path(excel_path)
@@ -66,6 +67,11 @@ class ExcelParser:
                 continue
 
             record = dict(zip(headers, row))
+
+            if video_filename:
+                record_filename = str(record.get("Video File", "")).strip()
+                if record_filename != video_filename:
+                    continue
 
             cycle = CycleService.save_cycle(
                 db=db,

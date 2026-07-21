@@ -40,14 +40,16 @@ def upload_video(
 
     try:
 
-        saved_path = UploadService.save_video(
+        saved_info = UploadService.save_video(
             file=file,
             upload_root=UPLOAD_DIR,
         )
+        saved_path = saved_info["path"]
+        sanitized_name = saved_info["original_name"]
 
         metadata = probe_video(saved_path)
 
-        output_dir = UploadService.create_output_directory(
+        output_dir = UploadService.create_batch_output_directory(
             OUTPUT_DIR,
         )
 
@@ -63,7 +65,7 @@ def upload_video(
         video = VideoRunService.create(
             db=db,
             batch_id=batch.id,
-            input_filename=Path(saved_path).name,
+            input_filename=sanitized_name,
             input_path=saved_path,
             queue_position=1,
         )
@@ -113,12 +115,12 @@ def upload_folder(
             detail="No files uploaded.",
         )
 
-    saved_files = UploadService.save_videos(
+    saved_files_info = UploadService.save_videos(
         files,
         UPLOAD_DIR,
     )
 
-    output_dir = UploadService.create_output_directory(
+    output_dir = UploadService.create_batch_output_directory(
         OUTPUT_DIR,
     )
 
@@ -126,21 +128,23 @@ def upload_folder(
         db=db,
         batch_name=batch_name,
         input_type="folder",
-        input_path=str(Path(saved_files[0]).parent),
+        input_path=str(Path(saved_files_info[0]["path"]).parent),
         output_path=output_dir,
-        total_videos=len(saved_files),
+        total_videos=len(saved_files_info),
     )
 
     ids = []
 
-    for index, path in enumerate(saved_files, start=1):
+    for index, file_info in enumerate(saved_files_info, start=1):
 
+        path = file_info["path"]
+        sanitized_name = file_info["original_name"]
         metadata = probe_video(path)
 
         video = VideoRunService.create(
             db=db,
             batch_id=batch.id,
-            input_filename=Path(path).name,
+            input_filename=sanitized_name,
             input_path=path,
             queue_position=index,
         )

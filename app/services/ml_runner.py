@@ -9,6 +9,8 @@ from app.database.database import SessionLocal
 
 from app.crud.batch import get_batch
 from app.crud.video_run import get_batch_video_runs
+from app.crud.cycle import get_video_cycles
+import json
 
 from app.services.batch_service import BatchService
 from app.services.video_run_service import VideoRunService
@@ -79,6 +81,47 @@ class MLRunner:
                 BatchService.complete(db=db, batch=batch)
             else:
                 BatchService.fail(db=db, batch=batch)
+
+            # Generate summary.json and metadata.json
+            total_cycles = 0
+            normal_ct = 0
+            anomaly_ct = 0
+            unknown_ct = 0
+            metadata_videos = []
+
+            for v in videos:
+                metadata_videos.append({
+                    "video_uuid": Path(v.input_path).stem,
+                    "original_name": v.input_filename
+                })
+                cycles = get_video_cycles(db, v.id)
+                total_cycles += len(cycles)
+                for c in cycles:
+                    if c.final_verdict == "NORMAL": normal_ct += 1
+                    elif c.final_verdict == "ANOMALY": anomaly_ct += 1
+                    else: unknown_ct += 1
+            
+            summary_data = {
+                "batch": f"Batch_{batch.id}",
+                "date": batch.created_at[:10],
+                "videos_processed": completed + failed,
+                "total_cycles": total_cycles,
+                "normal": normal_ct,
+                "anomaly": anomaly_ct,
+                "unknown": unknown_ct,
+            }
+            
+            metadata_data = {
+                "batch_uuid": Path(batch.output_path).stem if not batch.output_path.startswith("outputs") else "",
+                "videos": metadata_videos
+            }
+
+            out_path = Path(batch.output_path)
+            if out_path.exists():
+                with open(out_path / "summary.json", "w") as f:
+                    json.dump(summary_data, f, indent=2)
+                with open(out_path / "metadata.json", "w") as f:
+                    json.dump(metadata_data, f, indent=2)
 
             LogService.info(
                 db=db,
@@ -167,60 +210,54 @@ class MLRunner:
                 message=f"Starting inference : {video.input_filename}",
             )
 
-            output_dir = Path(batch.output_path) / Path(video.input_filename).stem
+            output_dir = Path(batch.output_path)
             output_dir.mkdir(parents=True, exist_ok=True)
 
             LogService.info(
                 db=db,
                 batch_id=batch.id,
                 video_run_id=video.id,
-                message="Launching ML process...",
+                message="Launching ML process in-memory...",
             )
 
-            process = InferenceEngine.start(
-                video_path=video.input_path,
-                output_dir=str(output_dir),
-            )
+            from app.services.model_manager import ModelManager
+            import models.inference_video_full_detection as inf_mod
+            
+            models_tuple = ModelManager.get_instance().get_models()
 
-            stdout_thread = threading.Thread(
-                target=self._read_stdout,
-                args=(process.stdout, batch.id, video.id),
-                daemon=True,
-            )
+            def on_message_callback(msg):
+                self._handle_inference_message(msg, batch.id, video.id)
 
-            stderr_thread = threading.Thread(
-                target=self._read_stderr,
-                args=(process.stderr, batch.id, video.id),
-                daemon=True,
-            )
-
-            stdout_thread.start()
-            stderr_thread.start()
-
+            returncode = 0
             try:
-                process.wait()
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                inf_mod.run_single_video(
+                    video_path=video.input_path,
+                    seg_model_path="", 
+                    out_base=str(output_dir),
+                    yolo_socket_path="",
+                    hand_pose_path="",
+                    print_summary=True,
+                    render_mode="frontend",
+                    original_name=video.input_filename,
+                    models=models_tuple,
+                    on_message=on_message_callback
+                )
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                returncode = 1
 
-            stdout_thread.join()
-            stderr_thread.join()
-
-            if process.returncode != 0:
+            if returncode != 0:
                 VideoRunService.fail(
                     db=db,
                     video=video,
-                    error_message=f"ML exited with code {process.returncode}",
+                    error_message=f"ML exited with code {returncode}",
                 )
                 LogService.error(
                     db=db,
                     batch_id=batch.id,
                     video_run_id=video.id,
-                    message=f"Inference failed ({process.returncode})",
+                    message=f"Inference failed ({returncode})",
                 )
                 return False
 
@@ -241,6 +278,7 @@ class MLRunner:
                         db=db,
                         video_run_id=video.id,
                         excel_path=str(excel_file),
+                        video_filename=video.input_filename,
                     )
                 except Exception as ex:
                     LogService.error(
@@ -310,90 +348,37 @@ class MLRunner:
     # ============================================================
     # Read stdout
     # ============================================================
-    def _read_stdout(
-        self,
-        stream,
-        batch_id,
-        video_run_id,
-    ):
+    def _handle_inference_message(self, line: str, batch_id: int, video_run_id: int):
         try:
-            while True:
-                try:
-                    line = stream.readline()
-                except ValueError:
-                    break
-
-                if not line:
-                    break
-
-                line = line.strip()
-                if not line:
-                    continue
-                
-                with SessionLocal() as thread_db:
-                    video = get_batch_video_runs(thread_db, batch_id)
-                    video_obj = next((v for v in video if v.id == video_run_id), None)
-                    
-                    if video_obj:
-                        ProgressParser.parse(
-                            db=thread_db,
-                            line=line,
-                            video=video_obj,
-                        )
-
-                    is_status_line = StatusParser.parse(
-                        line=line,
-                        batch_id=batch_id,
-                        video_id=video_run_id,
-                    )
-
-                    is_frame_line = FrameParser.parse(
-                        line=line,
-                        batch_id=batch_id,
-                        video_id=video_run_id,
-                    )
-
-                    if not is_status_line and not is_frame_line:
-                        LogService.info(
-                            db=thread_db,
-                            batch_id=batch_id,
-                            video_run_id=video_run_id,
-                            message=line,
-                        )
-        except Exception as e:
+            line = line.strip()
+            if not line:
+                return
+            
             with SessionLocal() as thread_db:
-                LogService.error(
-                    db=thread_db,
+                video = get_batch_video_runs(thread_db, batch_id)
+                video_obj = next((v for v in video if v.id == video_run_id), None)
+                
+                if video_obj:
+                    ProgressParser.parse(
+                        db=thread_db,
+                        line=line,
+                        video=video_obj,
+                    )
+
+                is_status_line = StatusParser.parse(
+                    line=line,
                     batch_id=batch_id,
-                    video_run_id=video_run_id,
-                    message=f"Error in stdout reader thread: {e}",
+                    video_id=video_run_id,
                 )
 
-    # ============================================================
-    # Read stderr
-    # ============================================================
-    def _read_stderr(
-        self,
-        stream,
-        batch_id,
-        video_run_id,
-    ):
-        try:
-            while True:
-                try:
-                    line = stream.readline()
-                except ValueError:
-                    break
+                is_frame_line = FrameParser.parse(
+                    line=line,
+                    batch_id=batch_id,
+                    video_id=video_run_id,
+                )
 
-                if not line:
-                    break
-
-                line = line.strip()
-                if not line:
-                    continue
-
-                with SessionLocal() as thread_db:
-                    LogService.error(
+                if not is_status_line and not is_frame_line:
+                    LogService.info(
                         db=thread_db,
                         batch_id=batch_id,
                         video_run_id=video_run_id,
@@ -405,8 +390,10 @@ class MLRunner:
                     db=thread_db,
                     batch_id=batch_id,
                     video_run_id=video_run_id,
-                    message=f"Error in stderr reader thread: {e}",
+                    message=f"Error in inference callback: {e}",
                 )
+
+
 
 
 # ============================================================

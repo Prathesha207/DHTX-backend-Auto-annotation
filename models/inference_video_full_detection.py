@@ -388,7 +388,7 @@ def load_yolo(path, label):
 def detect_socket(model, frame, conf_thr):
     if model is None:
         return None
-    res = model(frame, verbose=False)[0]
+    res = next(model(frame, stream=True, verbose=False))
     best, best_c = None, -1.0
     for box in res.boxes:
         c = float(box.conf[0])
@@ -423,7 +423,7 @@ def detect_hand_in_roi(pose_model, frame_bgr, roi, pose_conf_thr):
         return True
     if pose_model is None:
         return False
-    res = pose_model(frame_bgr, verbose=False)[0]
+    res = next(pose_model(frame_bgr, stream=True, verbose=False))
     if hasattr(res, "keypoints") and res.keypoints is not None:
         for kpts in res.keypoints.data:
             if kpts.shape[0] < 11:
@@ -1206,7 +1206,7 @@ class CycleManager:
         self.active = False
 
         dest_dir, folder_name = get_verdict_dir(self.resolved_output_dir, verdict)
-        final_name = f"{self.video_stem}_cycle{self.cycle_no:03d}.mp4"
+        final_name = f"{self.video_stem}_cycle{self.cycle_no:03d}_{verdict}.mp4"
         final_path = os.path.join(dest_dir, final_name)
         if Path(final_path).exists():
             Path(final_path).unlink()
@@ -1645,7 +1645,8 @@ def get_verdict_dir(out_dir, verdict):
 # ══════════════════════════════════════════════════════════════════════════════
 def process_video_cycles(video_path, resolved_output_dir, seg_net,
                          yolo_socket, yolo_pose, print_summary,
-                         enable_debug=False, render_mode="opencv"):
+                         enable_debug=False, render_mode="opencv", original_name="output",
+                         on_message=None):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[ERROR] Cannot open: {video_path}");  return None
@@ -1655,7 +1656,7 @@ def process_video_cycles(video_path, resolved_output_dir, seg_net,
     src_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[INFO] {Path(video_path).name} - {src_w}x{src_h} @ {fps_src:.1f} fps")
 
-    video_stem = Path(video_path).stem
+    video_stem = Path(original_name).stem
     cycles     = CycleManager(resolved_output_dir, video_stem, fps_src, (src_w, src_h))
 
     seg_engine   = SegmentationEngine(seg_net)
@@ -1665,7 +1666,9 @@ def process_video_cycles(video_path, resolved_output_dir, seg_net,
     seq_gate     = SequenceStabilityGate()
 
     WIN = f"v50_Merged | {os.path.basename(video_path)} | Q=quit D=debug F=fs M=maskdbg"
-    if SHOW_PREVIEW:
+    show_preview_active = SHOW_PREVIEW and render_mode != "frontend"
+
+    if show_preview_active:
         cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WIN, min(src_w, 1280), min(src_h, 720))
 
@@ -1723,7 +1726,7 @@ def process_video_cycles(video_path, resolved_output_dir, seg_net,
             card = draw_final_verdict_overlay(
                 last_vis, final_verdict, cycle_no=cycles.cycle_no, stats=stats_card)
             cycles.hold_final_frame(card)
-            if SHOW_PREVIEW:
+            if show_preview_active:
                 cv2.imshow(WIN, card);  cv2.waitKey(int(VERDICT_HOLD_SEC * 1000))
 
         display_verdict = _ORDER_DISPLAY.get(
@@ -1770,7 +1773,10 @@ def process_video_cycles(video_path, resolved_output_dir, seg_net,
         # frame_idx += 1
         frame_idx += 1
         if frame_idx % 15 == 0:
-            print(f"[PROGRESS] frame={frame_idx}", flush=True)
+            if on_message:
+                on_message(f"[PROGRESS] frame={frame_idx}")
+            else:
+                print(f"[PROGRESS] frame={frame_idx}", flush=True)
         t0  = time.perf_counter()
         vis = frame.copy()
 
@@ -1999,18 +2005,33 @@ def process_video_cycles(video_path, resolved_output_dir, seg_net,
                 "ok_votes":         vote_counter.normal_votes,
                 "anomaly_votes":    vote_counter.anomaly_votes,
             }
-            print(f"[STATUS] {json.dumps(status_payload)}", flush=True)
+            if on_message:
+                on_message(f"[STATUS] {json.dumps(status_payload)}")
+            else:
+                print(f"[STATUS] {json.dumps(status_payload)}", flush=True)
             last_emitted_state = state
 
         # Emit frame as base64 over stdout for the web UI
-        success, buffer = cv2.imencode('.jpg', vis_stream, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        vis_stream_out = vis_stream
+        if render_mode == "frontend":
+            h, w = vis_stream.shape[:2]
+            if w > 1280:
+                scale = 1280.0 / w
+                vis_stream_out = cv2.resize(vis_stream, (1280, int(h * scale)))
+            success, buffer = cv2.imencode('.jpg', vis_stream_out, [cv2.IMWRITE_JPEG_QUALITY, 65])
+        else:
+            success, buffer = cv2.imencode('.jpg', vis_stream_out, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
         if success:
             b64 = base64.b64encode(buffer).decode('utf-8')
-            print(f"[FRAME] {b64}", flush=True)
+            if on_message:
+                on_message(f"[FRAME] {b64}")
+            else:
+                print(f"[FRAME] {b64}", flush=True)
 
         cycles.write(vis);  last_vis = vis
 
-        if SHOW_PREVIEW:
+        if show_preview_active:
             cv2.imshow(WIN, vis)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -2031,7 +2052,7 @@ def process_video_cycles(video_path, resolved_output_dir, seg_net,
         _finalize_cycle()
 
     cap.release()
-    if SHOW_PREVIEW:
+    if show_preview_active:
         cv2.destroyWindow(WIN)
 
     return cycles
@@ -2192,7 +2213,8 @@ def append_to_excel(run_metrics, excel_dir):
 def run_single_video(video_path, seg_model_path, out_base,
                      yolo_socket_path, hand_pose_path, print_summary,
                      enable_debug=False, forced_channels=None,
-                     render_mode="opencv"):
+                     render_mode="opencv", original_name="output",
+                     models=None, on_message=None):
 
     print(f"[INFO] Device              : {DEVICE}")
     print(f"[INFO] Mode                : SINGLE VIDEO / MULTI-CYCLE (live inference, merged v45+v49)")
@@ -2226,35 +2248,38 @@ def run_single_video(video_path, seg_model_path, out_base,
     USE_RADIAL_CHANNEL = (IN_CHANNELS == 4)
     print(f"[INFO] in_channels         : {IN_CHANNELS}  radial={USE_RADIAL_CHANNEL}")
 
-    seg_net = smp.UnetPlusPlus(
-        encoder_name="tu-hrnet_w18",
-        encoder_weights=None,
-        in_channels=IN_CHANNELS,
-        classes=NUM_CLASSES,
-        activation=None,
-    ).to(DEVICE)
-    ckpt = torch.load(seg_model_path, map_location=DEVICE, weights_only=False)
-    seg_net.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
-    seg_net.eval()
-    with torch.no_grad():
-        seg_net(torch.zeros(1, IN_CHANNELS, *IMG_SIZE, device=DEVICE))
-    print("[INFO] GPU warmup done.")
+    if models:
+        seg_net, yolo_socket, yolo_pose = models
+        print("[INFO] Using pre-loaded models from ModelManager.")
+    else:
+        seg_net = smp.UnetPlusPlus(
+            encoder_name="tu-hrnet_w18",
+            encoder_weights=None,
+            in_channels=IN_CHANNELS,
+            classes=NUM_CLASSES,
+            activation=None,
+        ).to(DEVICE)
+        ckpt = torch.load(seg_model_path, map_location=DEVICE, weights_only=False)
+        seg_net.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
+        seg_net.eval()
+        with torch.no_grad():
+            seg_net(torch.zeros(1, IN_CHANNELS, *IMG_SIZE, device=DEVICE))
+        print("[INFO] GPU warmup done.")
 
-    yolo_socket = load_yolo(yolo_socket_path, "Socket")
-    yolo_pose   = load_yolo(hand_pose_path,   "Pose")
+        yolo_socket = load_yolo(yolo_socket_path, "Socket")
+        yolo_pose   = load_yolo(hand_pose_path,   "Pose")
 
     if not os.path.isfile(video_path):
         raise FileNotFoundError(f"Input video not found: {video_path}")
 
-    current_date        = datetime.now().strftime("%Y-%m-%d")
-    resolved_output_dir = os.path.join(out_base, current_date)
+    resolved_output_dir = out_base
     for sub in ("NORMAL", "ANOMALY", "UNKNOWN"):
         Path(os.path.join(resolved_output_dir, sub)).mkdir(parents=True, exist_ok=True)
 
     cycles = process_video_cycles(
         video_path, resolved_output_dir, seg_net,
         yolo_socket, yolo_pose, print_summary, enable_debug=enable_debug,
-        render_mode=render_mode)
+        render_mode=render_mode, original_name=original_name, on_message=on_message)
 
     if cycles is not None:
         cycles.final_report()
@@ -2269,6 +2294,7 @@ if __name__ == "__main__":
                     "engine + v49 nearest-pixel tube order + cycle logic + "
                     "3-way tracked identity lock + clean HAND state")
     ap.add_argument("--video",         default=DEFAULT_VIDEO, required=True)
+    ap.add_argument("--original_name", default="output",      help="Original filename stem for outputs")
     ap.add_argument("--model",         default=DEFAULT_MODEL)
     ap.add_argument("--out_base",      default=_OUT_BASE)
     ap.add_argument("--yolo",          default=DEFAULT_YOLO, required=True)
@@ -2362,4 +2388,5 @@ if __name__ == "__main__":
         enable_debug      = args.debug,
         forced_channels   = args.channels,
         render_mode       = args.render_mode,
+        original_name     = args.original_name,
     )

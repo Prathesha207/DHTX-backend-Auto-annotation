@@ -118,3 +118,38 @@ def delete_batch(batch_id: int, db: Session = Depends(get_db)):
         )
     crud_batch.delete_batch(db, db_batch)
     return None
+
+import os
+from fastapi.responses import FileResponse
+
+@router.get("/{batch_id}/open", status_code=status.HTTP_200_OK)
+def open_batch_folder(batch_id: int, db: Session = Depends(get_db)):
+    db_batch = crud_batch.get_batch(db, batch_id)
+    if not db_batch or not db_batch.output_path:
+        raise HTTPException(status_code=404, detail="Batch folder not found")
+        
+    folder_path = os.path.abspath(db_batch.output_path)
+    if not os.path.exists(folder_path):
+        raise HTTPException(status_code=404, detail="Folder does not exist on disk")
+        
+    try:
+        os.startfile(folder_path)
+        return {"message": "Folder opened"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/{batch_id}/summary", status_code=status.HTTP_200_OK)
+def get_batch_summary(batch_id: int, db: Session = Depends(get_db)):
+    db_batch = crud_batch.get_batch(db, batch_id)
+    if not db_batch or not db_batch.output_path:
+        raise HTTPException(status_code=404, detail="Batch output not found")
+        
+    summary_path = os.path.join(db_batch.output_path, "summary.json")
+    if not os.path.exists(summary_path):
+        raise HTTPException(status_code=404, detail="summary.json not found")
+        
+    return FileResponse(
+        path=summary_path,
+        media_type="application/json",
+        filename="summary.json"
+    )

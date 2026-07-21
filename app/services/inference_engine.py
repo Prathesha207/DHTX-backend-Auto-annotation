@@ -26,6 +26,7 @@ class InferenceEngine:
         *,
         video_path: str,
         output_dir: str,
+        original_name: str,
     ) -> list[str]:
 
         command = [
@@ -34,6 +35,9 @@ class InferenceEngine:
 
             "--video",
             video_path,
+
+            "--original_name",
+            original_name,
 
             "--model",
             str(SEQUENCE_MODEL),
@@ -79,11 +83,13 @@ class InferenceEngine:
         *,
         video_path: str,
         output_dir: str,
+        original_name: str,
     ):
 
         command = InferenceEngine.build_command(
             video_path=video_path,
             output_dir=output_dir,
+            original_name=original_name,
         )
 
         env = InferenceEngine.build_environment()
