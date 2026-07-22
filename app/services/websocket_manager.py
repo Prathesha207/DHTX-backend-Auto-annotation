@@ -20,6 +20,9 @@ class WebSocketManager:
         if websocket in self.connections[batch_id]:
             self.connections[batch_id].remove(websocket)
 
+    def has_clients(self, batch_id: int) -> bool:
+        return len(self.connections[batch_id]) > 0
+
     async def send(self, batch_id: int, data: dict):
         dead = []
         for ws in self.connections[batch_id]:
@@ -40,7 +43,11 @@ class WebSocketManager:
         """
         if self.loop is None:
             return   # server hasn't finished starting yet
-        asyncio.run_coroutine_threadsafe(self.send(batch_id, data), self.loop)
+        try:
+            if not self.loop.is_closed():
+                asyncio.run_coroutine_threadsafe(self.send(batch_id, data), self.loop)
+        except RuntimeError:
+            pass # Event loop is closed, ignore
 
 
 manager = WebSocketManager()

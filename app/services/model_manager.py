@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 # Ensure the models module can be imported
-sys.path.append(str(Path(__file__).resolve().parents[3]))
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from models.inference_video_full_detection import (
     load_yolo, 

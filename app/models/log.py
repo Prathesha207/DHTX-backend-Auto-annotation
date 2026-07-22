@@ -22,6 +22,12 @@ class Log(Base):
         nullable=True
     )
 
+    cycle_id = Column(Integer, nullable=True)
+
+    frame_number = Column(Integer, nullable=True)
+
+    state = Column(String, nullable=True)
+
     timestamp = Column(String, nullable=False)
 
     level = Column(String, default="info")

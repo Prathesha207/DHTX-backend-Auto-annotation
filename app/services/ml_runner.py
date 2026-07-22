@@ -17,11 +17,11 @@ from app.services.video_run_service import VideoRunService
 from app.services.log_service import LogService
 
 from app.services.excel_parser import ExcelParser
-from app.services.progress_parser import ProgressParser
-from app.services.status_parser import StatusParser
-from app.services.frame_parser import FrameParser
 from app.services.inference_engine import InferenceEngine
+from app.services.websocket_manager import manager
 from app.video_metadata import probe_video
+from app.crud.inference_config import get_config
+from app.services.inference_state_machine import InferenceStateMachine, InferenceConfigSnapshot
 
 # ============================================================
 # Configuration
@@ -56,40 +56,47 @@ class MLRunner:
             )
 
             videos = get_batch_video_runs(db, batch.id)
-            completed = 0
-            failed = 0
-
-            for video in videos:
+            
+            for idx, video in enumerate(videos, start=1):
+                if video.status in ("completed", "failed", "cancelled"):
+                    continue
+                
+                # If it was left 'running' from a crash, reset to queued implicitly by just running it
                 success = self.run_video(
                     db=db,
                     batch=batch,
                     video=video,
+                    batch_index=idx,
+                    batch_total=len(videos),
                 )
-                if success:
-                    completed += 1
-                else:
-                    failed += 1
-
+                
+                # Re-query all to get true counts
+                all_v = get_batch_video_runs(db, batch.id)
+                comp = sum(1 for v in all_v if v.status == "completed")
+                fail = sum(1 for v in all_v if v.status == "failed")
+                
                 BatchService.update_progress(
                     db=db,
                     batch=batch,
-                    completed_videos=completed,
-                    failed_videos=failed,
+                    completed_videos=comp,
+                    failed_videos=fail,
                 )
 
-            if failed == 0:
-                BatchService.complete(db=db, batch=batch)
-            else:
-                BatchService.fail(db=db, batch=batch)
+            # Final tally
+            final_videos = get_batch_video_runs(db, batch.id)
+            final_comp = sum(1 for v in final_videos if v.status == "completed")
+            final_fail = sum(1 for v in final_videos if v.status == "failed")
+            final_canc = sum(1 for v in final_videos if v.status == "cancelled")
+            final_pend = len(final_videos) - (final_comp + final_fail + final_canc)
 
-            # Generate summary.json and metadata.json
+
             total_cycles = 0
             normal_ct = 0
             anomaly_ct = 0
             unknown_ct = 0
             metadata_videos = []
 
-            for v in videos:
+            for v in final_videos:
                 metadata_videos.append({
                     "video_uuid": Path(v.input_path).stem,
                     "original_name": v.input_filename
@@ -104,7 +111,12 @@ class MLRunner:
             summary_data = {
                 "batch": f"Batch_{batch.id}",
                 "date": batch.created_at[:10],
-                "videos_processed": completed + failed,
+                "videos_discovered": len(final_videos),
+                "completed": final_comp,
+                "failed": final_fail,
+                "cancelled": final_canc,
+                "pending": final_pend,
+                "videos_processed": final_comp + final_fail,
                 "total_cycles": total_cycles,
                 "normal": normal_ct,
                 "anomaly": anomaly_ct,
@@ -122,6 +134,12 @@ class MLRunner:
                     json.dump(summary_data, f, indent=2)
                 with open(out_path / "metadata.json", "w") as f:
                     json.dump(metadata_data, f, indent=2)
+
+            if final_fail == 0 and final_canc == 0 and final_pend == 0:
+                BatchService.complete(db=db, batch=batch)
+            else:
+                # If there are fails or it was cancelled, mark batch as failed/partial
+                BatchService.fail(db=db, batch=batch)
 
             LogService.info(
                 db=db,
@@ -177,6 +195,8 @@ class MLRunner:
         db: Session,
         batch,
         video,
+        batch_index: int = None,
+        batch_total: int = None,
     ) -> bool:
         try:
             try:
@@ -221,27 +241,52 @@ class MLRunner:
             )
 
             from app.services.model_manager import ModelManager
-            import models.inference_video_full_detection as inf_mod
-            
             models_tuple = ModelManager.get_instance().get_models()
 
-            def on_message_callback(msg):
-                self._handle_inference_message(msg, batch.id, video.id)
+            config_db = get_config(db)
+            config_snap = InferenceConfigSnapshot(
+                model1_frame_count=config_db.model1_frame_count,
+                model1_pass_frames=config_db.model1_pass_frames,
+                model2_start_skip_frame=config_db.model2_start_skip_frame,
+                model2_frame_count=config_db.model2_frame_count,
+                model2_pass_frames=config_db.model2_pass_frames,
+                socket_absent_frames=config_db.socket_absent_frames,
+                socket_loss_abort_frames=config_db.socket_loss_abort_frames,
+                enable_debug_logging=config_db.enable_debug_logging,
+                enable_perf_logging=config_db.enable_perf_logging,
+            )
+
+            LogService.info(
+                db=db,
+                batch_id=batch.id,
+                video_run_id=video.id,
+                message=(
+                    f"Loaded Config - "
+                    f"M1: {config_snap.model1_pass_frames}/{config_snap.model1_frame_count} "
+                    f"| M2 Skip: {config_snap.model2_start_skip_frame} "
+                    f"| M2: {config_snap.model2_pass_frames}/{config_snap.model2_frame_count} "
+                    f"| SockAbst: {config_snap.socket_absent_frames} "
+                    f"| SockAbort: {config_snap.socket_loss_abort_frames}"
+                )
+            )
+
+            state_machine = InferenceStateMachine(
+                db=db,
+                batch_id=batch.id,
+                video_run_id=video.id,
+                video_path=video.input_path,
+                output_dir=str(output_dir),
+                original_name=video.input_filename,
+                models=models_tuple,
+                config=config_snap,
+                enable_debug=os.environ.get("ENABLE_DEBUG", "0") == "1",
+            )
 
             returncode = 0
             try:
-                inf_mod.run_single_video(
-                    video_path=video.input_path,
-                    seg_model_path="", 
-                    out_base=str(output_dir),
-                    yolo_socket_path="",
-                    hand_pose_path="",
-                    print_summary=True,
-                    render_mode="frontend",
-                    original_name=video.input_filename,
-                    models=models_tuple,
-                    on_message=on_message_callback
-                )
+                success = state_machine.run()
+                if not success:
+                    returncode = 1
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -274,12 +319,30 @@ class MLRunner:
                     message="Parsing inspection_log.xlsx",
                 )
                 try:
-                    ExcelParser.parse(
+                    cycles = ExcelParser.parse(
                         db=db,
                         video_run_id=video.id,
                         excel_path=str(excel_file),
-                        video_filename=video.input_filename,
+                        video_filename=Path(video.input_path).name,
                     )
+                    if not cycles:
+                        LogService.warning(
+                            db=db,
+                            batch_id=batch.id,
+                            video_run_id=video.id,
+                            message=(
+                                f"Excel file was parsed but 0 rows matched filename "
+                                f"'{Path(video.input_path).name}'. Check the 'Video File' column in "
+                                f"{excel_file} against this value."
+                            ),
+                        )
+                    else:
+                        LogService.info(
+                            db=db,
+                            batch_id=batch.id,
+                            video_run_id=video.id,
+                            message=f"Saved {len(cycles)} cycle(s) from inspection_log.xlsx",
+                        )
                 except Exception as ex:
                     LogService.error(
                         db=db,
@@ -345,53 +408,7 @@ class MLRunner:
             )
             return False
 
-    # ============================================================
-    # Read stdout
-    # ============================================================
-    def _handle_inference_message(self, line: str, batch_id: int, video_run_id: int):
-        try:
-            line = line.strip()
-            if not line:
-                return
-            
-            with SessionLocal() as thread_db:
-                video = get_batch_video_runs(thread_db, batch_id)
-                video_obj = next((v for v in video if v.id == video_run_id), None)
-                
-                if video_obj:
-                    ProgressParser.parse(
-                        db=thread_db,
-                        line=line,
-                        video=video_obj,
-                    )
-
-                is_status_line = StatusParser.parse(
-                    line=line,
-                    batch_id=batch_id,
-                    video_id=video_run_id,
-                )
-
-                is_frame_line = FrameParser.parse(
-                    line=line,
-                    batch_id=batch_id,
-                    video_id=video_run_id,
-                )
-
-                if not is_status_line and not is_frame_line:
-                    LogService.info(
-                        db=thread_db,
-                        batch_id=batch_id,
-                        video_run_id=video_run_id,
-                        message=line,
-                    )
-        except Exception as e:
-            with SessionLocal() as thread_db:
-                LogService.error(
-                    db=thread_db,
-                    batch_id=batch_id,
-                    video_run_id=video_run_id,
-                    message=f"Error in inference callback: {e}",
-                )
+    # String callbacks are removed since InferenceStateMachine logs natively.
 
 
 

@@ -67,7 +67,10 @@ class VideoRunService:
             },
         )
 
-        return update_video_run(db, video)
+        # DEBOUNCE DB WRITES: Only commit to SQLite every 5 frames, or on the last frame
+        if current_frame % 5 == 0 or current_frame == total_frames or current_frame == 1:
+            return update_video_run(db, video)
+        return video
 
     @staticmethod
     def update_metadata(

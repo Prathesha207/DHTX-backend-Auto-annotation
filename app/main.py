@@ -15,6 +15,7 @@ from app.models import (
     video_run,
     cycle,
     log,
+    inference_config,
 )
 
 # Import routers
@@ -25,12 +26,19 @@ from app.routes import (
     logs,
     upload,
     ws,
+    settings,
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+
+    # Seed inference configuration defaults
+    from app.crud.inference_config import get_config
+    from app.database.database import SessionLocal
+    with SessionLocal() as db:
+        get_config(db)
 
     from app.services.websocket_manager import manager
     manager.set_loop(asyncio.get_running_loop())   # ADD — fixes the crash
@@ -114,6 +122,7 @@ app.include_router(cycles.router)
 app.include_router(logs.router)
 app.include_router(upload.router)
 app.include_router(ws.router)
+app.include_router(settings.router)
 
 os.makedirs("outputs", exist_ok=True)
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")

@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS video_runs (
     input_filename      TEXT NOT NULL,
     input_path          TEXT NOT NULL,
     output_video_path   TEXT,
+    excel_report_path   TEXT,
     queue_position      INTEGER NOT NULL,
     status              TEXT NOT NULL DEFAULT 'queued'
                             CHECK(status IN ('queued','running','completed','cancelled','failed')),
@@ -67,7 +68,25 @@ CREATE TABLE IF NOT EXISTS logs (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id            INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
     video_run_id        INTEGER REFERENCES video_runs(id) ON DELETE CASCADE,
+    cycle_id            INTEGER,
+    frame_number        INTEGER,
+    state               TEXT,
     timestamp           TEXT NOT NULL,
-    level               TEXT NOT NULL DEFAULT 'info' CHECK(level IN ('info','warning','error')),
+    level               TEXT NOT NULL DEFAULT 'info' CHECK(level IN ('info','warning','error','debug','perf')),
     message             TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inference_config (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    model1_frame_count        INTEGER NOT NULL DEFAULT 30,
+    model1_pass_frames        INTEGER NOT NULL DEFAULT 28,
+    model2_start_skip_frame   INTEGER NOT NULL DEFAULT 10,
+    model2_frame_count        INTEGER NOT NULL DEFAULT 20,
+    model2_pass_frames        INTEGER NOT NULL DEFAULT 18,
+    socket_absent_frames      INTEGER NOT NULL DEFAULT 10,
+    socket_loss_abort_frames  INTEGER NOT NULL DEFAULT 15,
+    enable_debug_logging      BOOLEAN NOT NULL DEFAULT 0,
+    enable_perf_logging       BOOLEAN NOT NULL DEFAULT 1,
+    created_at                TEXT,
+    updated_at                TEXT
 );

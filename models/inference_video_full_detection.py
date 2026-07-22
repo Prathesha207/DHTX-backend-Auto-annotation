@@ -1183,7 +1183,7 @@ class CycleManager:
         self.writer = cv2.VideoWriter(
             self.temp_path, cv2.VideoWriter_fourcc(*"mp4v"),
             self.fps_src, self.frame_size)
-        print(f"\n[CYCLE START] #{self.cycle_no:03d}  ({self.video_stem})")
+        # print removed — caller (state machine or process_video_cycles) logs this
 
     def write(self, frame):
         if self.active and self.writer is not None:
@@ -1220,10 +1220,7 @@ class CycleManager:
             self.unknown += 1
 
         duration_s = time.time() - (self.start_time or time.time())
-        print(f"[CYCLE END]    #{self.cycle_no:03d}  ->  {verdict:<8}  "
-              f"({duration_s:.1f}s)  ->  {final_path}")
-        print(f"[RUNNING TOTAL] PASSED={self.passed}  FAILED={self.failed}  "
-              f"UNKNOWN={self.unknown}  (of {self.total_cycles} cycles)")
+        # print removed — caller (state machine or process_video_cycles) logs this
 
         summary = {
             "cycle_no":      self.cycle_no,
@@ -1237,15 +1234,12 @@ class CycleManager:
         return summary
 
     def final_report(self):
-        W = 62
-        print("\n" + "#" * W)
-        print("  FINAL CYCLE REPORT")
-        print("#" * W)
-        print(f"  TOTAL CYCLES      : {self.total_cycles}")
-        print(f"  PASSED (NORMAL)   : {self.passed}")
-        print(f"  FAILED (ANOMALY)  : {self.failed}")
-        print(f"  UNKNOWN           : {self.unknown}")
-        print("#" * W + "\n")
+        return {
+            "total_cycles": self.total_cycles,
+            "passed": self.passed,
+            "failed": self.failed,
+            "unknown": self.unknown,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1646,7 +1640,7 @@ def get_verdict_dir(out_dir, verdict):
 def process_video_cycles(video_path, resolved_output_dir, seg_net,
                          yolo_socket, yolo_pose, print_summary,
                          enable_debug=False, render_mode="opencv", original_name="output",
-                         on_message=None):
+                         on_message=None, has_clients_callback=None):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[ERROR] Cannot open: {video_path}");  return None
@@ -1765,6 +1759,10 @@ def process_video_cycles(video_path, resolved_output_dir, seg_net,
             print("=" * 62 + "\n")
         if summary:
             append_to_excel(summary, resolved_output_dir)
+            if on_message:
+                on_message("[CYCLE_COMPLETE]")
+            else:
+                print("[CYCLE_COMPLETE]", flush=True)
 
     while True:
         ret, frame = cap.read()
@@ -2011,23 +2009,34 @@ def process_video_cycles(video_path, resolved_output_dir, seg_net,
                 print(f"[STATUS] {json.dumps(status_payload)}", flush=True)
             last_emitted_state = state
 
-        # Emit frame as base64 over stdout for the web UI
-        vis_stream_out = vis_stream
-        if render_mode == "frontend":
-            h, w = vis_stream.shape[:2]
-            if w > 1280:
-                scale = 1280.0 / w
-                vis_stream_out = cv2.resize(vis_stream, (1280, int(h * scale)))
-            success, buffer = cv2.imencode('.jpg', vis_stream_out, [cv2.IMWRITE_JPEG_QUALITY, 65])
-        else:
-            success, buffer = cv2.imencode('.jpg', vis_stream_out, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-        if success:
-            b64 = base64.b64encode(buffer).decode('utf-8')
-            if on_message:
-                on_message(f"[FRAME] {b64}")
+        # Emit frame as base64 over stdout for the web UI.
+        # [FIX] Skip the resize/encode/base64 work entirely when nobody is
+        # connected to watch this batch's live preview -- there's no queue
+        # here to build a backlog (this path is synchronous), but paying
+        # the JPEG+base64 cost every single frame for zero viewers is pure
+        # waste and directly eats into your FPS ceiling.
+        no_clients = (
+            render_mode == "frontend"
+            and has_clients_callback is not None
+            and not has_clients_callback()
+        )
+        if not no_clients:
+            vis_stream_out = vis_stream
+            if render_mode == "frontend":
+                h, w = vis_stream.shape[:2]
+                if w > 1280:
+                    scale = 1280.0 / w
+                    vis_stream_out = cv2.resize(vis_stream, (1280, int(h * scale)))
+                success, buffer = cv2.imencode('.jpg', vis_stream_out, [cv2.IMWRITE_JPEG_QUALITY, 65])
             else:
-                print(f"[FRAME] {b64}", flush=True)
+                success, buffer = cv2.imencode('.jpg', vis_stream_out, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+            if success:
+                b64 = base64.b64encode(buffer).decode('utf-8')
+                if on_message:
+                    on_message(f"[FRAME] {b64}")
+                else:
+                    print(f"[FRAME] {b64}", flush=True)
 
         cycles.write(vis);  last_vis = vis
 
@@ -2056,6 +2065,30 @@ def process_video_cycles(video_path, resolved_output_dir, seg_net,
         cv2.destroyWindow(WIN)
 
     return cycles
+
+
+def run_frame_inference(seg_engine, frame_bgr, socket_centre, socket_bbox,
+                        warmup_done, enable_debug):
+    """
+    Single-frame inference: segmentation + tube order evaluation.
+    Used by the new InferenceStateMachine. Returns a results dict.
+    Does NOT log, does NOT render — pure computation.
+    """
+    lock_engage = (
+        True if LOCK_ENGAGE_MODE == "immediate" else warmup_done
+    )
+    pred_map = seg_engine.infer(
+        frame_bgr, socket_centre=socket_centre,
+        apply_identity_lock=lock_engage)
+    status_dict, raw_order, detected_seq, dbg = evaluate_tube_order(
+        pred_map, socket_bbox, debug=enable_debug)
+    return {
+        "pred_map": pred_map,
+        "status_dict": status_dict,
+        "raw_order": raw_order,
+        "detected_seq": detected_seq,
+        "dbg": dbg,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2198,13 +2231,13 @@ def append_to_excel(run_metrics, excel_dir):
     for attempt in range(1, MAX_EXCEL_RETRIES + 1):
         try:
             wb.save(excel_path)
-            print(f"[EXCEL] Row #{next_sr} (cycle #{run_metrics.get('cycle_no','-')}) -> {excel_path}")
-            return
+            return {"status": "ok", "row": next_sr, "path": excel_path}
         except PermissionError:
             if attempt == MAX_EXCEL_RETRIES:
                 raise
-            print(f"[WARN] Excel locked, retry {attempt}/{MAX_EXCEL_RETRIES} in 5s...")
+            # Retry silently — caller can log if needed
             time.sleep(5)
+    return {"status": "ok", "row": next_sr, "path": excel_path}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2214,7 +2247,7 @@ def run_single_video(video_path, seg_model_path, out_base,
                      yolo_socket_path, hand_pose_path, print_summary,
                      enable_debug=False, forced_channels=None,
                      render_mode="opencv", original_name="output",
-                     models=None, on_message=None):
+                     models=None, on_message=None, has_clients_callback=None):
 
     print(f"[INFO] Device              : {DEVICE}")
     print(f"[INFO] Mode                : SINGLE VIDEO / MULTI-CYCLE (live inference, merged v45+v49)")
@@ -2279,7 +2312,8 @@ def run_single_video(video_path, seg_model_path, out_base,
     cycles = process_video_cycles(
         video_path, resolved_output_dir, seg_net,
         yolo_socket, yolo_pose, print_summary, enable_debug=enable_debug,
-        render_mode=render_mode, original_name=original_name, on_message=on_message)
+        render_mode=render_mode, original_name=original_name, on_message=on_message,
+        has_clients_callback=has_clients_callback)
 
     if cycles is not None:
         cycles.final_report()

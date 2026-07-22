@@ -29,7 +29,7 @@ def create_batch(batch_in: BatchCreate, db: Session = Depends(get_db)):
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 
 @router.post("/{batch_id}/start", status_code=status.HTTP_202_ACCEPTED)
-def start_batch(batch_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def start_batch(batch_id: int, db: Session = Depends(get_db)):
     db_batch = crud_batch.get_batch(db, batch_id)
     if not db_batch:
         raise HTTPException(
@@ -37,7 +37,9 @@ def start_batch(batch_id: int, background_tasks: BackgroundTasks, db: Session = 
             detail=f"Batch with ID {batch_id} not found"
         )
     from app.services.ml_runner import run_batch_inference_task
-    background_tasks.add_task(run_batch_inference_task, batch_id)
+    import threading
+    t = threading.Thread(target=run_batch_inference_task, args=(batch_id,), daemon=True)
+    t.start()
     return {"message": "Batch inference started"}
 
 @router.get("/", response_model=List[BatchResponse])
