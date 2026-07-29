@@ -8,7 +8,9 @@ from fastapi import (
     UploadFile,
     HTTPException,
     status,
+    Body,
 )
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.dependencies import get_db
@@ -26,6 +28,16 @@ router = APIRouter(
 
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
+
+ALLOWED_VIDEO_EXTENSIONS = {
+    ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".mpeg", ".mpg", ".m4v", ".webm", ".flv", ".3gp", ".ts",
+    ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"
+}
+
+
+class LocalFolderRequest(BaseModel):
+    folder_path: str
+    batch_name: str | None = None
 
 
 @router.post(
@@ -86,6 +98,7 @@ def upload_video(
 
         return {
             "batch_id": batch.id,
+            "batch_name": Path(batch.output_path).name if batch.output_path else None,
             "video_run_id": video.id,
             "message": "Video uploaded successfully",
         }
@@ -133,13 +146,14 @@ def upload_folder(
         total_videos=len(saved_files_info),
     )
 
-    ids = []
-
     for index, file_info in enumerate(saved_files_info, start=1):
 
         path = file_info["path"]
         sanitized_name = file_info["original_name"]
-        metadata = probe_video(path)
+        try:
+            metadata = probe_video(path)
+        except Exception:
+            metadata = {"width": 0, "height": 0, "fps": 0, "duration_seconds": 0, "total_frames": 0}
 
         video = VideoRunService.create(
             db=db,
@@ -160,13 +174,176 @@ def upload_folder(
 
         video.total_frames = metadata["total_frames"]
 
-        db.commit()
-        db.refresh(video)
+    db.commit()
 
-        ids.append(video.id)
+    from app.models.video_run import VideoRun
+    ids = [vid for (vid,) in db.query(VideoRun.id).filter(VideoRun.batch_id == batch.id).order_by(VideoRun.queue_position.asc()).all()]
 
     return {
         "batch_id": batch.id,
+        "batch_name": Path(batch.output_path).name if batch.output_path else None,
         "video_run_ids": ids,
         "message": "Folder uploaded successfully",
     }
+
+
+@router.post(
+    "/local-folder",
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_local_folder(
+    request: LocalFolderRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Register videos from a local folder path (no file upload needed).
+    Used by the Electron app where backend & frontend share the same machine.
+    The folder_path must be an absolute path accessible to the backend process.
+    """
+    folder = Path(request.folder_path)
+
+    if not folder.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Folder does not exist: {request.folder_path}",
+        )
+
+    if not folder.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Path is not a directory: {request.folder_path}",
+        )
+
+    # Collect all supported video/image files (non-recursive to keep it predictable)
+    video_files = sorted([
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in ALLOWED_VIDEO_EXTENSIONS
+    ])
+
+    if len(video_files) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No supported video or image files found in the selected folder.",
+        )
+
+    output_dir = UploadService.create_batch_output_directory(OUTPUT_DIR)
+
+    batch = BatchService.create(
+        db=db,
+        batch_name=request.batch_name,
+        input_type="folder",
+        input_path=str(folder),
+        output_path=output_dir,
+        total_videos=len(video_files),
+    )
+
+    for index, video_path in enumerate(video_files, start=1):
+        try:
+            metadata = probe_video(str(video_path))
+        except Exception:
+            metadata = {"width": 0, "height": 0, "fps": 0, "duration_seconds": 0, "total_frames": 0}
+
+        video = VideoRunService.create(
+            db=db,
+            batch_id=batch.id,
+            input_filename=video_path.name,
+            input_path=str(video_path),
+            queue_position=index,
+        )
+
+        VideoRunService.update_metadata(
+            db=db,
+            video=video,
+            width=metadata["width"],
+            height=metadata["height"],
+            fps=metadata["fps"],
+            duration_seconds=metadata["duration_seconds"],
+        )
+
+        video.total_frames = metadata["total_frames"]
+
+    db.commit()
+
+    from app.models.video_run import VideoRun
+    ids = [v for (v,) in db.query(VideoRun.id).filter(VideoRun.batch_id == batch.id).order_by(VideoRun.queue_position.asc()).all()]
+
+    return {
+        "batch_id": batch.id,
+        "batch_name": Path(batch.output_path).name if batch.output_path else None,
+        "video_run_ids": ids,
+        "message": f"Local folder registered: {len(ids)} video(s) found",
+    }
+
+
+@router.post(
+    "/local-video",
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_local_video(
+    request: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Register a single local video file by absolute path (no file upload needed).
+    Used by the Electron app where backend & frontend share the same machine.
+    """
+    file_path_str = request.get("file_path")
+    batch_name_val = request.get("batch_name")
+
+    if not file_path_str:
+        raise HTTPException(status_code=400, detail="file_path is required")
+
+    file_path = Path(file_path_str)
+
+    if not file_path.exists():
+        raise HTTPException(status_code=400, detail=f"File does not exist: {file_path_str}")
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Path is not a file: {file_path_str}")
+
+    if file_path.suffix.lower() not in ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_path.suffix}")
+
+    try:
+        metadata = probe_video(str(file_path))
+    except Exception:
+        metadata = {"width": 0, "height": 0, "fps": 0, "duration_seconds": 0, "total_frames": 0}
+
+    output_dir = UploadService.create_batch_output_directory(OUTPUT_DIR)
+
+    batch = BatchService.create(
+        db=db,
+        batch_name=batch_name_val,
+        input_type="video",
+        input_path=str(file_path),
+        output_path=output_dir,
+        total_videos=1,
+    )
+
+    video = VideoRunService.create(
+        db=db,
+        batch_id=batch.id,
+        input_filename=file_path.name,
+        input_path=str(file_path),
+        queue_position=1,
+    )
+
+    VideoRunService.update_metadata(
+        db=db,
+        video=video,
+        width=metadata["width"],
+        height=metadata["height"],
+        fps=metadata["fps"],
+        duration_seconds=metadata["duration_seconds"],
+    )
+
+    video.total_frames = metadata["total_frames"]
+    db.commit()
+    db.refresh(video)
+
+    return {
+        "batch_id": batch.id,
+        "batch_name": Path(batch.output_path).name if batch.output_path else None,
+        "video_run_id": video.id,
+        "message": "Local video registered successfully",
+    }

@@ -73,21 +73,40 @@ class PerfMonitor:
         prev_fps = 1000.0 / max(self._frame_times[-2], 0.001)
         return alpha * fps + (1.0 - alpha) * prev_fps
 
-    @staticmethod
-    def get_gpu_utilization() -> dict | None:
-        """Return GPU utilization and VRAM usage if CUDA is available."""
+    _last_gpu_stats: dict | None = None
+    _last_gpu_check_time: float = 0.0
+
+    @classmethod
+    def get_gpu_utilization(cls) -> dict | None:
+        """Return GPU utilization and VRAM usage if CUDA is available, cached to 1 sec."""
+        now = time.time()
+        if now - cls._last_gpu_check_time < 1.0:
+            return cls._last_gpu_stats
+
         try:
             import torch
             if not torch.cuda.is_available():
                 return None
             allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
             reserved = torch.cuda.memory_reserved(0) / (1024 ** 3)
-            total = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
-            return {
+            total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            gpu_util = 0
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                h = pynvml.nvmlDeviceGetHandleByIndex(0)
+                gpu_util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
+            except Exception:
+                pass
+            stats = {
+                "gpu_utilization_pct": int(gpu_util),
                 "gpu_allocated_gb": round(allocated, 2),
                 "gpu_reserved_gb": round(reserved, 2),
                 "gpu_total_gb": round(total, 2),
             }
+            cls._last_gpu_stats = stats
+            cls._last_gpu_check_time = now
+            return stats
         except Exception:
             return None
 

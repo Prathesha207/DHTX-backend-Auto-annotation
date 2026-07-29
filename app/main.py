@@ -1,3 +1,17 @@
+import sys
+
+# [FIX] Ensure stdout/stderr use UTF-8 regardless of the console/terminal
+# encoding. This prevents UnicodeEncodeError when the ML pipeline prints
+# box-drawing characters (═, █, →, etc.) on a Windows cp1252 console.
+# errors='replace' ensures a bad character becomes '?' rather than crashing.
+# This complements the PYTHONIOENCODING=utf-8 set in start_backend.bat and
+# the Electron spawn env — either fix alone is sufficient, both together
+# guarantee coverage across all deployment modes.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from contextlib import asynccontextmanager
 import asyncio
 import os
@@ -36,9 +50,11 @@ async def lifespan(app: FastAPI):
 
     # Seed inference configuration defaults
     from app.crud.inference_config import get_config
+    from app.services.recovery_manager import RecoveryManager
     from app.database.database import SessionLocal
     with SessionLocal() as db:
         get_config(db)
+        RecoveryManager.recover_orphaned_jobs(db)
 
     from app.services.websocket_manager import manager
     manager.set_loop(asyncio.get_running_loop())   # ADD — fixes the crash
@@ -60,6 +76,10 @@ async def lifespan(app: FastAPI):
 
     print("=" * 60)
     print("SQLite database initialized.")
+    
+    # Initialize background job queue
+    from app.services.job_queue import job_queue
+    
     yield
 
 app = FastAPI(
@@ -106,10 +126,29 @@ app.openapi = custom_openapi
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from fastapi import Request
+import time
+from app.services.api_logger import api_logger
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    
+    # Process the request
+    response = await call_next(request)
+    
+    process_time = (time.time() - start_time) * 1000
+    formatted_process_time = f"{process_time:.2f}ms"
+    
+    # Log the API request details
+    api_logger.info(f"[API REQUEST] {request.method} {request.url.path} | Status: {response.status_code} | Time: {formatted_process_time}")
+    
+    return response
 
 
 # ===========================

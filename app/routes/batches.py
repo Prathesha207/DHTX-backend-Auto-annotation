@@ -28,19 +28,40 @@ def create_batch(batch_in: BatchCreate, db: Session = Depends(get_db)):
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 
-@router.post("/{batch_id}/start", status_code=status.HTTP_202_ACCEPTED)
-def start_batch(batch_id: int, db: Session = Depends(get_db)):
+@router.post("/{batch_id}/start")
+def start_batch(batch_id: int, stream_hud: bool = False, db: Session = Depends(get_db)):
     db_batch = crud_batch.get_batch(db, batch_id)
     if not db_batch:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Batch with ID {batch_id} not found"
         )
-    from app.services.ml_runner import run_batch_inference_task
-    import threading
-    t = threading.Thread(target=run_batch_inference_task, args=(batch_id,), daemon=True)
-    t.start()
-    return {"message": "Batch inference started"}
+    
+    db_batch.status = "queued"
+    db.commit()
+    
+    # Import here to avoid circular imports during startup
+    from app.services.job_queue import job_queue
+    
+    return {"message": "Batch added to inference queue"}
+
+@router.post("/{batch_id}/cancel")
+def cancel_batch(batch_id: int, db: Session = Depends(get_db)):
+    db_batch = crud_batch.get_batch(db, batch_id)
+    if not db_batch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Batch with ID {batch_id} not found"
+        )
+    
+    from app.services.job_queue import job_queue
+    canceled = job_queue.cancel_batch(batch_id)
+    
+    if not canceled:
+        db_batch.status = "cancelled"
+        db.commit()
+        
+    return {"message": "Batch cancelled"}
 
 @router.get("/", response_model=List[BatchResponse])
 def read_batches(db: Session = Depends(get_db)):
@@ -143,15 +164,58 @@ def open_batch_folder(batch_id: int, db: Session = Depends(get_db)):
 @router.get("/{batch_id}/summary", status_code=status.HTTP_200_OK)
 def get_batch_summary(batch_id: int, db: Session = Depends(get_db)):
     db_batch = crud_batch.get_batch(db, batch_id)
-    if not db_batch or not db_batch.output_path:
-        raise HTTPException(status_code=404, detail="Batch output not found")
+    if not db_batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
         
-    summary_path = os.path.join(db_batch.output_path, "summary.json")
-    if not os.path.exists(summary_path):
-        raise HTTPException(status_code=404, detail="summary.json not found")
-        
-    return FileResponse(
-        path=summary_path,
-        media_type="application/json",
-        filename="summary.json"
-    )
+    from app.models.video_run import VideoRun
+    from app.models.cycle import Cycle
+    
+    videos = db.query(VideoRun).filter(VideoRun.batch_id == batch_id).all()
+    
+    completed = 0
+    failed = 0
+    cancelled = 0
+    pending = 0
+    
+    total_cycles = 0
+    normal = 0
+    anomaly = 0
+    unknown = 0
+    
+    for v in videos:
+        if v.status == "completed":
+            completed += 1
+        elif v.status == "failed":
+            failed += 1
+        elif v.status in ("cancelled", "interrupted"):
+            cancelled += 1
+        else:
+            pending += 1
+            
+        cycles = db.query(Cycle).filter(Cycle.video_run_id == v.id).all()
+        total_cycles += len(cycles)
+        for c in cycles:
+            verdict = c.final_verdict.upper() if c.final_verdict else "UNKNOWN"
+            if verdict == "NORMAL":
+                normal += 1
+            elif verdict == "ANOMALY":
+                anomaly += 1
+            else:
+                unknown += 1
+
+    return {
+        "batch": f"Batch_{batch_id}",
+        "date": db_batch.created_at[:10] if db_batch.created_at else "",
+        "videos_discovered": len(videos),
+        "completed": completed,
+        "failed": failed,
+        "cancelled": cancelled,
+        "pending": pending,
+        "videos_processed": completed + failed,
+        "total_cycles": total_cycles,
+        "normal": normal,
+        "anomaly": anomaly,
+        "unknown": unknown,
+        "started_at": db_batch.started_at,
+        "completed_at": db_batch.completed_at,
+    }

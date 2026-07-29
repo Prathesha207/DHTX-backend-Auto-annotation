@@ -92,6 +92,10 @@ def get_video_progress(
         "output_video_path": video.output_video_path,
 
         "error_message": video.error_message,
+
+        "started_at": video.started_at,
+
+        "completed_at": video.completed_at,
     }
 
 import cv2
@@ -247,6 +251,10 @@ def get_video_result(
             "fps": video.fps,
 
             "total_frames": video.total_frames,
+
+            "started_at": video.started_at,
+
+            "completed_at": video.completed_at,
         },
 
         "summary": {

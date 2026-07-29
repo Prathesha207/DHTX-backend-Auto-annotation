@@ -89,7 +89,7 @@ class ExcelParser:
                 duration_seconds=None,
 
                 final_verdict=ExcelParser._str(
-                    record.get("Final Verdict")
+                    record.get("Status")
                 ) or "UNKNOWN",
 
                 output_video_path=ExcelParser._str(

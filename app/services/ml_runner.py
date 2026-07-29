@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime
 import threading
 import subprocess
 from pathlib import Path
@@ -10,14 +11,13 @@ from app.database.database import SessionLocal
 from app.crud.batch import get_batch
 from app.crud.video_run import get_batch_video_runs
 from app.crud.cycle import get_video_cycles
+from app.models.video_run import VideoRun
 import json
 
 from app.services.batch_service import BatchService
 from app.services.video_run_service import VideoRunService
 from app.services.log_service import LogService
-
 from app.services.excel_parser import ExcelParser
-from app.services.inference_engine import InferenceEngine
 from app.services.websocket_manager import manager
 from app.video_metadata import probe_video
 from app.crud.inference_config import get_config
@@ -27,9 +27,15 @@ from app.services.inference_state_machine import InferenceStateMachine, Inferenc
 # Configuration
 # ============================================================
 
+from app.services.inference_settings import settings
+
 BASE_DIR = Path(__file__).resolve().parents[2]
 MODEL_DIR = BASE_DIR / "models" / "ml"
-SCRIPT_PATH = BASE_DIR / "models" / "inference_video_full_detection.py"
+
+if settings.ml_pipeline == "new":
+    SCRIPT_PATH = BASE_DIR / "models" / "inference_video_full_detection_new.py"
+else:
+    SCRIPT_PATH = BASE_DIR / "models" / "inference_video_full_detection.py"
 YOLO_MODEL = MODEL_DIR / "best.pt"
 POSE_MODEL = MODEL_DIR / "yolov8n-pose.pt"
 SEQUENCE_MODEL = MODEL_DIR / "best_model_finetuned_manual.pth"
@@ -40,7 +46,7 @@ SEQUENCE_MODEL = MODEL_DIR / "best_model_finetuned_manual.pth"
 
 class MLRunner:
 
-    def run_batch(self, batch_id: int):
+    def run_batch(self, batch_id: int, stream_hud: bool = False, cancel_event=None):
         with SessionLocal() as db:
             batch = get_batch(db, batch_id)
 
@@ -57,17 +63,27 @@ class MLRunner:
 
             videos = get_batch_video_runs(db, batch.id)
             
-            for idx, video in enumerate(videos, start=1):
-                if video.status in ("completed", "failed", "cancelled"):
+            for idx in range(len(videos)):
+                video_id = videos[idx].id
+                
+                # Re-query the video run in each iteration to avoid DetachedInstanceError
+                video = db.query(VideoRun).filter(VideoRun.id == video_id).first()
+                if not video or video.status in ("completed", "failed", "cancelled"):
                     continue
                 
-                # If it was left 'running' from a crash, reset to queued implicitly by just running it
+                if cancel_event and cancel_event.is_set():
+                    video.status = "cancelled"
+                    db.commit()
+                    continue
+                
                 success = self.run_video(
                     db=db,
                     batch=batch,
                     video=video,
-                    batch_index=idx,
+                    batch_index=idx + 1,
                     batch_total=len(videos),
+                    stream_hud=stream_hud,
+                    cancel_event=cancel_event
                 )
                 
                 # Re-query all to get true counts
@@ -82,14 +98,33 @@ class MLRunner:
                     failed_videos=fail,
                 )
 
-            # Final tally
             final_videos = get_batch_video_runs(db, batch.id)
             final_comp = sum(1 for v in final_videos if v.status == "completed")
             final_fail = sum(1 for v in final_videos if v.status == "failed")
             final_canc = sum(1 for v in final_videos if v.status == "cancelled")
             final_pend = len(final_videos) - (final_comp + final_fail + final_canc)
 
+            db.refresh(batch)
+            
+            # 1. Update batch status based on video statuses
+            if final_pend == 0:
+                if final_fail > 0:
+                    BatchService.fail(db=db, batch=batch)
+                elif final_canc > 0:
+                    batch.status = "cancelled"
+                    batch.completed_at = datetime.now().isoformat()
+                    db.commit()
+                    db.refresh(batch)
+                    from app.services.websocket_manager import manager
+                    manager.send_threadsafe(batch.id, {"type": "batch", "status": "cancelled"})
+                    manager.send_threadsafe(batch.id, {"type": "finished"})
+                else:
+                    BatchService.complete(db=db, batch=batch)
+            else:
+                # If there are still pending videos, but the loop exited, it's a failure
+                BatchService.fail(db=db, batch=batch)
 
+            # 2. Gather cycles and generate JSON summary
             total_cycles = 0
             normal_ct = 0
             anomaly_ct = 0
@@ -134,12 +169,6 @@ class MLRunner:
                     json.dump(summary_data, f, indent=2)
                 with open(out_path / "metadata.json", "w") as f:
                     json.dump(metadata_data, f, indent=2)
-
-            if final_fail == 0 and final_canc == 0 and final_pend == 0:
-                BatchService.complete(db=db, batch=batch)
-            else:
-                # If there are fails or it was cancelled, mark batch as failed/partial
-                BatchService.fail(db=db, batch=batch)
 
             LogService.info(
                 db=db,
@@ -197,6 +226,8 @@ class MLRunner:
         video,
         batch_index: int = None,
         batch_total: int = None,
+        stream_hud: bool = False,
+        **kwargs
     ) -> bool:
         try:
             try:
@@ -280,16 +311,24 @@ class MLRunner:
                 models=models_tuple,
                 config=config_snap,
                 enable_debug=os.environ.get("ENABLE_DEBUG", "0") == "1",
+                stream_hud=stream_hud,
             )
 
             returncode = 0
             try:
-                success = state_machine.run()
+                success = state_machine.run(cancel_event=kwargs.get("cancel_event"))
                 if not success:
                     returncode = 1
             except Exception as e:
                 import traceback
-                traceback.print_exc()
+                error_trace = traceback.format_exc()
+                print(error_trace, file=sys.stderr)
+                LogService.error(
+                    db=db,
+                    batch_id=batch.id,
+                    video_run_id=video.id,
+                    message=f"Pipeline exception: {type(e).__name__} - {str(e)}\n{error_trace}"
+                )
                 returncode = 1
 
             if returncode != 0:
@@ -407,6 +446,16 @@ class MLRunner:
                 message=str(ex),
             )
             return False
+            
+        finally:
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
 
     # String callbacks are removed since InferenceStateMachine logs natively.
 
@@ -418,6 +467,7 @@ class MLRunner:
 # ============================================================
 def run_batch_inference_task(
     batch_id: int,
+    stream_hud: bool = False,
 ):
     runner = MLRunner()
-    runner.run_batch(batch_id)
+    runner.run_batch(batch_id, stream_hud=stream_hud)

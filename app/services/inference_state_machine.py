@@ -31,8 +31,8 @@ import numpy as np
 from sqlalchemy.orm import Session
 
 # ── Inference engine imports (functions, NOT the main loop) ──────
-import models.inference_video_full_detection as inf_mod
-from models.inference_video_full_detection import (
+from app.services import ml_adapter as inf_mod
+from app.services.ml_adapter import (
     detect_socket,
     detect_hand_in_roi,
     build_roi,
@@ -41,14 +41,13 @@ from models.inference_video_full_detection import (
     SequenceStabilityGate,
     AnomalyConfirmGate,
     CycleManager,
-    run_frame_inference,
     append_to_excel,
-    draw_seg_overlay,
     draw_raw_argmax_fallback,
     draw_socket_box,
     draw_production_status_bar,
     draw_hud,
     draw_debug_overlay,
+    draw_seg_overlay,
     draw_final_verdict_overlay,
     YOLO_SOCKET_CONF,
     YOLO_POSE_CONF,
@@ -134,6 +133,7 @@ class InferenceStateMachine:
         models: tuple,
         config: InferenceConfigSnapshot,
         enable_debug: bool = False,
+        stream_hud: bool = False,
     ):
         self.db = db
         self.batch_id = batch_id
@@ -309,7 +309,7 @@ class InferenceStateMachine:
     #  Main entry point
     # ══════════════════════════════════════════════════════════════
 
-    def run(self):
+    def run(self, cancel_event=None):
         """
         Process the video. Returns True on success, False on error.
         """
@@ -321,21 +321,30 @@ class InferenceStateMachine:
                        f"pass={self.config.model2_pass_frames} | "
                        f"absent={self.config.socket_absent_frames}")
 
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            self._log_error(f"Cannot open video: {self.video_path}")
+        if not os.path.exists(self.video_path):
+            self._log_error(f"Video file not found: {self.video_path}")
             return False
 
-        fps_src = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            self._log_error(f"Failed to open video: {self.video_path}")
+            return False
+
+        # Attempt to gather total frames for progress bar
+        total_frames_est = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames_est <= 0:
+            total_frames_est = 3000
+
+        fps_src = cap.get(cv2.CAP_PROP_FPS)
+        if fps_src <= 0 or fps_src > 120:
+            fps_src = 30.0
+
         src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames_est = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if src_w == 0 or src_h == 0:
+            src_w, src_h = 1920, 1080
 
-        self._log_info(f"Video: {src_w}x{src_h} @ {fps_src:.1f} fps, "
-                       f"~{total_frames_est} frames")
-        self._fps_ema = fps_src
-
-        video_stem = Path(self.original_name).stem
+        video_stem = Path(self.video_path).stem
 
         # Create output subdirectories
         for sub in ("NORMAL", "ANOMALY", "UNKNOWN"):
@@ -355,102 +364,115 @@ class InferenceStateMachine:
         self._emit_capabilities()
         self._emit_event("inference_started", {"total_frames": total_frames_est})
 
-        # ── Frame loop ───────────────────────────────────────────
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            self.frame_idx += 1
-            self.perf.start_frame()
+        try:
+    # ── Frame loop ───────────────────────────────────────────
+            while True:
+                if cancel_event and cancel_event.is_set():
+                    self._log_warning("Inference cancelled via cancel_event")
+                    break
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                self.frame_idx += 1
+                self.perf.start_frame()
 
-            vis = frame.copy()
+                vis = frame.copy()
 
-            # ── Dispatch to current state handler ────────────────
-            vis = self._dispatch_frame(frame, vis, ZERO_PRED)
+                # ── Dispatch to current state handler ────────────────
+                vis = self._dispatch_frame(frame, vis, ZERO_PRED)
+                
+                # Copy for frontend stream before HUD text is applied
+                frontend_vis = vis.copy()
 
-            # ── Rendering (HUD + production bar) ─────────────────
-            hud_state = self._get_hud_state()
+                # ── Rendering (HUD + production bar) ─────────────────
+                hud_state = self._get_hud_state()
 
-            # Production status bar
-            vis = draw_production_status_bar(
-                vis, hud_state,
-                self.cycle_mgr.cycle_no,
-                self.cycle_mgr.passed,
-                self.cycle_mgr.failed,
-                self.cycle_mgr.unknown,
-            )
-
-            # HUD
-            vis = draw_hud(
-                vis, self._fps_ema, self.frame_idx, hud_state,
-                self.last_sock_hit,
-                self.status_dict, self.order_status, self.detected_seq,
-                anomaly_counter=self.anomaly_gate._count if self.anomaly_gate else 0,
-                hand_in_roi=self.hand_in_roi,
-                warmup_frame=self.m1_valid_total,
-                warmup_retry=0,
-                vote_counter=self.vote_counter,
-                infer_frames=self.infer_frames,
-                seq_stable_ctr=self.seq_gate._stable_ct if self.seq_gate else 0,
-                cycle_no=self.cycle_mgr.cycle_no,
-            )
-
-            if self.enable_debug and self.current_dbg:
-                vis = draw_debug_overlay(vis, self.current_dbg)
-
-            # ── FPS ──────────────────────────────────────────────
-            frame_ms = self.perf.end_frame()
-            if frame_ms > 0:
-                cur_fps = 1000.0 / frame_ms
-                self._fps_ema = 0.88 * self._fps_ema + 0.12 * cur_fps
-
-            # ── Emit [STATUS] for frontend ───────────────────────
-            if self.frame_idx % 5 == 0 or self.state != self._last_emitted_state:
-                self._emit_status()
-                self._last_emitted_state = self.state
-
-            # ── Emit [FRAME] for live preview ────────────────────
-            if manager.has_clients(self.batch_id):
-                self._emit_frame(vis, src_w)
-
-            # ── Write to cycle video ─────────────────────────────
-            self.cycle_mgr.write(vis)
-            self.last_vis = vis
-
-            # ── Progress report ──────────────────────────────────
-            if self.frame_idx % 15 == 0:
-                VideoRunService.update_progress(
-                    db=self.db,
-                    video=self._get_video_run(),
-                    current_frame=self.frame_idx,
-                    total_frames=total_frames_est,
+                # Production status bar
+                vis = draw_production_status_bar(
+                    vis, hud_state,
+                    self.cycle_mgr.cycle_no,
+                    self.cycle_mgr.passed,
+                    self.cycle_mgr.failed,
+                    self.cycle_mgr.unknown,
                 )
 
-            # ── Performance logging ──────────────────────────────
-            if self.frame_idx % 30 == 0:
-                breakdown = self.perf.frame_summary()
-                self._log_perf(
-                    f"frame_time={frame_ms:.1f}ms "
-                    f"sections={breakdown} "
-                    f"FPS={self._fps_ema:.1f}"
+                # HUD
+                vis = draw_hud(
+                    vis, self._fps_ema, self.frame_idx, hud_state,
+                    self.last_sock_hit,
+                    self.status_dict, self.order_status, self.detected_seq,
+                    anomaly_counter=self.anomaly_gate._count if self.anomaly_gate else 0,
+                    hand_in_roi=self.hand_in_roi,
+                    warmup_frame=self.m1_valid_total,
+                    warmup_retry=0,
+                    vote_counter=self.vote_counter,
+                    infer_frames=self.infer_frames,
+                    seq_stable_ctr=self.seq_gate._stable_ct if self.seq_gate else 0,
+                    cycle_no=self.cycle_mgr.cycle_no,
                 )
-                gpu = PerfMonitor.get_gpu_utilization()
-                if gpu:
-                    self._log_perf(
-                        f"GPU alloc={gpu['gpu_allocated_gb']}GB "
-                        f"reserved={gpu['gpu_reserved_gb']}GB "
-                        f"total={gpu['gpu_total_gb']}GB"
+
+                if self.enable_debug and self.current_dbg:
+                    vis = draw_debug_overlay(vis, self.current_dbg)
+
+                # ── FPS ──────────────────────────────────────────────
+                frame_ms = self.perf.end_frame()
+                if frame_ms > 0:
+                    cur_fps = 1000.0 / frame_ms
+                    self._fps_ema = 0.88 * self._fps_ema + 0.12 * cur_fps
+
+                # ── Emit [STATUS] for frontend ───────────────────────
+                if self.frame_idx % 5 == 0 or self.state != self._last_emitted_state:
+                    self._emit_status()
+                    self._last_emitted_state = self.state
+
+                # ── Emit [FRAME] for live preview ────────────────────
+                if manager.has_clients(self.batch_id):
+                    self._emit_frame(frontend_vis, src_w)
+
+                # ── Write to cycle video ─────────────────────────────
+                self.cycle_mgr.write(vis)
+                self.last_vis = vis
+
+                # ── Progress report ──────────────────────────────────
+                if self.frame_idx % 15 == 0:
+                    VideoRunService.update_progress(
+                        db=self.db,
+                        video=self._get_video_run(),
+                        current_frame=self.frame_idx,
+                        total_frames=total_frames_est,
                     )
-                cpu = PerfMonitor.get_cpu_utilization()
-                if cpu is not None:
-                    self._log_perf(f"CPU={cpu:.1f}%")
 
-        # ── End of video ─────────────────────────────────────────
-        # If a cycle is still active (video ended mid-cycle), finalize it
-        if self.cycle_mgr.active:
-            self._finalize_current_cycle()
+                # ── Performance logging ──────────────────────────────
+                if self.frame_idx % 30 == 0:
+                    breakdown = self.perf.frame_summary()
+                    self._log_perf(
+                        f"frame_time={frame_ms:.1f}ms "
+                        f"sections={breakdown} "
+                        f"FPS={self._fps_ema:.1f}"
+                    )
+                    gpu = PerfMonitor.get_gpu_utilization()
+                    if gpu:
+                        self._log_perf(
+                            f"GPU alloc={gpu['gpu_allocated_gb']}GB "
+                            f"reserved={gpu['gpu_reserved_gb']}GB "
+                            f"total={gpu['gpu_total_gb']}GB"
+                        )
+                    cpu = PerfMonitor.get_cpu_utilization()
+                    if cpu is not None:
+                        self._log_perf(f"CPU={cpu:.1f}%")
 
-        cap.release()
+            
+
+
+        finally:
+    # ── End of video ─────────────────────────────────────────
+            # If a cycle is still active (video ended mid-cycle), finalize it
+            if self.cycle_mgr and self.cycle_mgr.active:
+                self._finalize_current_cycle(abort=True)
+
+            if cap:
+                cap.release()
+
         
         manager.send_threadsafe(
             self.batch_id,
@@ -463,12 +485,12 @@ class InferenceStateMachine:
         )
 
         # Final report
-        report = self.cycle_mgr.final_report()
+        self.cycle_mgr.final_report()
         self._log_info(
-            f"FINAL REPORT: total={report['total_cycles']} "
-            f"passed={report['passed']} "
-            f"failed={report['failed']} "
-            f"unknown={report['unknown']}"
+            f"FINAL REPORT: total={self.cycle_mgr.total_cycles} "
+            f"passed={self.cycle_mgr.passed} "
+            f"failed={self.cycle_mgr.failed} "
+            f"unknown={self.cycle_mgr.unknown}"
         )
 
         flush_pending_logs()
@@ -758,20 +780,49 @@ class InferenceStateMachine:
         self.cycle_total_frames += 1
 
         self.perf.start_section("model2")
-        result = run_frame_inference(
-            self.seg_engine, frame,
+        self.pred_map = self.seg_engine.infer(
+            frame,
             socket_centre=self.last_socket_centre,
-            socket_bbox=sock_hit["bbox"] if sock_hit else None,
-            warmup_done=True,  # M2 always runs post-warmup
-            enable_debug=self.enable_debug,
+            apply_identity_lock=True
+        )
+
+        from app.services.ml_adapter import (
+            restrict_mask_to_socket_roi, evaluate_tube_order,
+            MASK_ROI_CLASSES, MASK_ROI_SHAPE, MASK_ROI_AUTO_SCALE,
+            MASK_ROI_RADIUS, MASK_ROI_RADIUS_X, MASK_ROI_RADIUS_Y,
+            MASK_ROI_RADIUS_UP, MASK_ROI_RADIUS_DOWN,
+            MASK_ROI_RADIUS_LEFT, MASK_ROI_RADIUS_RIGHT,
+            MASK_ROI_OFFSET_X, MASK_ROI_OFFSET_Y, MASK_ROI_POLYGON
+        )
+
+        sock_bbox = sock_hit["bbox"] if sock_hit else None
+        sock_w = (sock_bbox[2] - sock_bbox[0]) if sock_bbox else None
+        sock_h = (sock_bbox[3] - sock_bbox[1]) if sock_bbox else None
+        bbox_size = (sock_w, sock_h) if sock_w and sock_h else None
+
+        self.pred_map = restrict_mask_to_socket_roi(
+            self.pred_map, center=self.last_socket_centre,
+            bbox_size=bbox_size,
+            classes=MASK_ROI_CLASSES,
+            shape=MASK_ROI_SHAPE,
+            auto_scale=MASK_ROI_AUTO_SCALE,
+            radius=MASK_ROI_RADIUS,
+            radius_x=MASK_ROI_RADIUS_X,
+            radius_y=MASK_ROI_RADIUS_Y,
+            radius_up=MASK_ROI_RADIUS_UP,
+            radius_down=MASK_ROI_RADIUS_DOWN,
+            radius_left=MASK_ROI_RADIUS_LEFT,
+            radius_right=MASK_ROI_RADIUS_RIGHT,
+            offset_x=MASK_ROI_OFFSET_X,
+            offset_y=MASK_ROI_OFFSET_Y,
+            polygon=MASK_ROI_POLYGON
+        )
+
+        self.status_dict, raw_order, self.detected_seq, self.current_dbg = evaluate_tube_order(
+            self.pred_map, sock_bbox,
+            debug=self.enable_debug
         )
         self.perf.end_section("model2")
-
-        self.pred_map = result["pred_map"]
-        self.status_dict = result["status_dict"]
-        raw_order = result["raw_order"]
-        self.detected_seq = result["detected_seq"]
-        self.current_dbg = result["dbg"]
 
         # Gate chain
         stable_order = self.seq_gate.update(raw_order, self.detected_seq)
@@ -883,7 +934,7 @@ class InferenceStateMachine:
         self._reset_all()
         self._transition(WAIT_FOR_SOCKET)
 
-    def _finalize_current_cycle(self):
+    def _finalize_current_cycle(self, abort=False):
         """End the current cycle, write DB + Excel."""
         if not self.cycle_mgr.active:
             return

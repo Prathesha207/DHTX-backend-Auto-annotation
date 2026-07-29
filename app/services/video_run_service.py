@@ -42,6 +42,11 @@ class VideoRunService:
 
         return update_video_run(db, video)
 
+    # FIX: Track how many times update_progress has been called so we can
+    # throttle the expensive batch-level DB query + commit (2 SELECTs + 1 COMMIT)
+    # to fire only every 5 progress events instead of every single one.
+    _progress_call_count: int = 0
+
     @staticmethod
     def update_progress(
         db: Session,
@@ -49,7 +54,13 @@ class VideoRunService:
         *,
         current_frame: int,
         total_frames: int,
+        fps: float = 0.0,
+        elapsed_seconds: float = 0.0,
+        eta_seconds: float = 0.0,
     ):
+
+        if not video:
+            return None
 
         video.current_frame = current_frame
         video.total_frames = total_frames
@@ -57,18 +68,52 @@ class VideoRunService:
         if total_frames and total_frames > 0:
             video.progress = (current_frame / total_frames) * 100
 
+        batch_progress = video.progress
+
+        VideoRunService._progress_call_count += 1
+        # FIX: Only do the expensive batch-level query every 5 calls (was every call).
+        # This avoids 2 SQL SELECTs + 1 db.commit() on every progress update during inference.
+        if VideoRunService._progress_call_count % 5 == 0 or current_frame == total_frames or current_frame == 1:
+            try:
+                from app.models.video_run import VideoRun
+                from app.models.batch import Batch
+                batch = db.query(Batch).filter(Batch.id == video.batch_id).first()
+                if batch and batch.total_videos > 0:
+                    all_runs = db.query(VideoRun).filter(VideoRun.batch_id == video.batch_id).all()
+                    total_prog = 0.0
+                    for r in all_runs:
+                        if r.id == video.id:
+                            total_prog += (video.progress or 0.0)
+                        elif r.status == "completed":
+                            total_prog += 100.0
+                        else:
+                            total_prog += (r.progress or 0.0)
+                    batch_progress = min(max(total_prog / batch.total_videos, 0.0), 100.0)
+                    batch.progress = batch_progress
+                    db.commit()
+            except Exception:
+                pass
+
+        # WebSocket emit fires every call — frontend stays responsive.
         manager.send_threadsafe(
             video.batch_id,
             {
                 "type": "progress",
                 "video_id": video.id,
                 "progress": video.progress,
+                "batch_progress": batch_progress,
                 "current_frame": video.current_frame,
+                "fps": fps,
+                "elapsed_seconds": elapsed_seconds,
+                "eta_seconds": eta_seconds,
             },
         )
 
-        # DEBOUNCE DB WRITES: Only commit to SQLite every 5 frames, or on the last frame
-        if current_frame % 5 == 0 or current_frame == total_frames or current_frame == 1:
+        # FIX: Removed the redundant second db.commit() that previously fired every 5 frames
+        # on top of the batch commit above. The batch commit above already covers the video row
+        # since both objects share the same session and the video.progress was modified above.
+        # Only force a video-level commit at the very first and last frame.
+        if current_frame == 1 or current_frame == total_frames:
             return update_video_run(db, video)
         return video
 

@@ -10,6 +10,13 @@ class InferenceSettings:
     """
 
     # ==========================================================
+    # Integration Configuration
+    # ==========================================================
+    # Toggle between "legacy" (inference_video_full_detection.py)
+    # and "new" (inference_video_full_detection_new.py)
+    ml_pipeline: str = "new"
+
+    # ==========================================================
     # Frame Processing
     # ==========================================================
 
