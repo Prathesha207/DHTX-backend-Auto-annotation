@@ -45,16 +45,30 @@ class UploadService:
             sanitized_name = UploadService.sanitize_filename(original_path.stem)
 
         file_uuid = uuid4().hex
-        filename = f"{file_uuid}{extension}"
+        filename = f"{sanitized_name}{extension}"
         destination = upload_dir / filename
 
+        import hashlib
+        import os
+        sha256_hash = hashlib.sha256()
+
         with destination.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            # Read in chunks to compute hash
+            while True:
+                chunk = file.file.read(8192)
+                if not chunk:
+                    break
+                buffer.write(chunk)
+                sha256_hash.update(chunk)
+                
+        file_size = os.path.getsize(destination)
 
         return {
             "path": str(destination),
             "original_name": sanitized_name,
-            "uuid": file_uuid
+            "uuid": file_uuid,
+            "checksum": sha256_hash.hexdigest(),
+            "file_size": file_size
         }
 
     @staticmethod

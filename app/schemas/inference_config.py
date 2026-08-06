@@ -15,6 +15,7 @@ class InferenceConfigResponse(BaseModel):
     socket_loss_abort_frames: int
     enable_debug_logging: bool
     enable_perf_logging: bool
+    default_output_dir: str
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -29,6 +30,7 @@ class InferenceConfigUpdate(BaseModel):
     socket_loss_abort_frames: Optional[int] = Field(None, gt=0)
     enable_debug_logging: Optional[bool] = None
     enable_perf_logging: Optional[bool] = None
+    default_output_dir: Optional[str] = None
 
     @model_validator(mode="after")
     def check_pass_lte_count(self):

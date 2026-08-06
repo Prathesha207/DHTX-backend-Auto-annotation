@@ -15,6 +15,7 @@ _DEFAULTS = dict(
     socket_loss_abort_frames=15,
     enable_debug_logging=False,
     enable_perf_logging=True,
+    default_output_dir="outputs",
 )
 
 

@@ -10,6 +10,8 @@ def create_video_run(
     input_filename: str,
     input_path: str,
     queue_position: int,
+    file_size: int = None,
+    checksum: str = None,
     created_at: str,
 ) -> VideoRun:
 
@@ -18,6 +20,8 @@ def create_video_run(
         input_filename=input_filename,
         input_path=input_path,
         queue_position=queue_position,
+        file_size=file_size,
+        checksum=checksum,
         created_at=created_at,
         status="queued",
         progress=0,

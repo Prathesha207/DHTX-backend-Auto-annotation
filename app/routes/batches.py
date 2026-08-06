@@ -36,6 +36,9 @@ def start_batch(batch_id: int, stream_hud: bool = False, db: Session = Depends(g
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Batch with ID {batch_id} not found"
         )
+    from app.services.job_queue import job_queue
+    if job_queue.running_batch_id == batch_id:
+        return {"message": "Batch is already running"}
     
     db_batch.status = "queued"
     db.commit()

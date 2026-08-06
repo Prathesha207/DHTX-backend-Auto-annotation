@@ -1,0 +1,44 @@
+[
+  {
+    "run": 1,
+    "test": "Environment",
+    "duration": 0.050225019454956055,
+    "status": "PASS"
+  },
+  {
+    "run": 1,
+    "test": "Upload",
+    "duration": 0.04453730583190918,
+    "status": "PASS"
+  },
+  {
+    "run": 1,
+    "test": "Inference",
+    "duration": 4.24799108505249,
+    "status": "PASS"
+  },
+  {
+    "run": 1,
+    "test": "WebSocket",
+    "duration": 5.608916997909546,
+    "status": "PASS"
+  },
+  {
+    "run": 1,
+    "test": "Cancel",
+    "duration": 4.074109792709351,
+    "status": "PASS"
+  },
+  {
+    "run": 1,
+    "test": "Recovery",
+    "duration": 1.207172155380249,
+    "status": "PASS"
+  },
+  {
+    "run": 1,
+    "test": "Health",
+    "duration": 5.169584274291992,
+    "status": "PASS"
+  }
+]

@@ -22,30 +22,61 @@ class RecoveryManager:
         - ANY video run that is 'running', 'queued', or 'pending' is marked 'pending'.
         """
         try:
-            # ── Reset unfinished batches so they can be resumed ──
+            # ── Clean up orphaned processing video files ──
+            import os
+            from pathlib import Path
+            output_dir = Path("outputs")
+            if output_dir.exists():
+                for p in output_dir.rglob("__processing__*"):
+                    try:
+                        p.unlink()
+                        print(f"[RECOVERY] Deleted orphaned temp video: {p.name}")
+                    except Exception as e:
+                        print(f"[RECOVERY ERROR] Could not delete {p}: {e}")
+
+            # ── Cancel unfinished batches so the queue is empty ──
             unfinished_batches = db.query(Batch).filter(
-                Batch.status.in_(["running", "queued", "pending"])
+                Batch.status.in_(["running", "queued", "pending", "interrupted"])
             ).all()
             for b in unfinished_batches:
                 old_status = b.status
-                b.status = "queued"
-                print(f"[RECOVERY] Batch {b.id}: {old_status} -> queued (ready to resume)")
-                # Update in-memory session for UI sync
+                b.status = "interrupted"
+                b.interrupted_reason = "BACKEND_CRASH"
+                print(f"[RECOVERY] Batch {b.id}: {old_status} -> interrupted")
+                
+                # Load persisted state if available
+                from app.models.job_session_state import JobSessionState
+                state_obj = db.query(JobSessionState).filter(JobSessionState.batch_id == b.id).first()
                 session = job_session_mgr.create_session(b.id, b.total_videos)
-                session.status = "queued"
-                session.progress = b.progress
+                
+                if state_obj and state_obj.state_json:
+                    state = state_obj.state_json
+                    session.progress = state.get("progress", b.progress)
+                    session.batch_progress = state.get("batch_progress", b.progress)
+                    session.video_progress = state.get("video_progress", 0)
+                    session.current_video = state.get("current_video", 1)
+                    session.completed_videos = state.get("completed_videos", 0)
+                    session.last_completed_video_id = state.get("last_completed_video_id")
+                    session.last_completed_queue_position = state.get("last_completed_queue_position")
+                    session.current_filename = state.get("current_filename")
+                    session.current_frame = state.get("current_frame", 0)
+                    session.total_frames = state.get("total_frames", 0)
+                    session.latest_statistics = state.get("statistics", {})
+                    
+                session.status = "interrupted"
 
-            # ── Reset unfinished video runs so they will be retried ──
+            # ── Cancel unfinished video runs ──
             unfinished_runs = db.query(VideoRun).filter(
-                VideoRun.status.in_(["running", "queued", "pending"])
+                VideoRun.status.in_(["running", "queued", "pending", "interrupted"])
             ).all()
             for r in unfinished_runs:
-                r.status = "pending"
-                print(f"[RECOVERY] VideoRun {r.id}: -> pending (ready to retry)")
+                r.status = "interrupted"
+                r.interrupted_reason = "BACKEND_CRASH"
+                print(f"[RECOVERY] VideoRun {r.id}: -> interrupted")
 
             if unfinished_batches or unfinished_runs:
                 db.commit()
-                print(f"[RECOVERY] Done: {len(unfinished_batches)} batches and {len(unfinished_runs)} video runs recovered for resume.")
+                print(f"[RECOVERY] Done: {len(unfinished_batches)} batches and {len(unfinished_runs)} video runs interrupted.")
             else:
                 print("[RECOVERY] No orphaned jobs found.")
         except Exception as e:

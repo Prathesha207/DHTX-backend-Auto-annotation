@@ -5,3 +5,8 @@ __pycache__/
 uploads/
 outputs/
 .pytest_cache/
+*.avi
+*.mp4
+archive/
+db/
+logs/

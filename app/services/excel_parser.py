@@ -70,7 +70,7 @@ class ExcelParser:
 
             if video_filename:
                 record_filename = str(record.get("Video File", "")).strip()
-                if record_filename != video_filename:
+                if Path(record_filename).stem != Path(video_filename).stem:
                     continue
 
             cycle = CycleService.save_cycle(

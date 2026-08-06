@@ -1,0 +1,20 @@
+{
+    "config_version": 1,
+    "gpu_options": {
+        "vram_sweep_frequency": 10,
+        "sweep_on_oom": true
+    },
+    "queue_settings": {
+        "max_concurrent_batches": 1,
+        "max_retries_recoverable": 3
+    },
+    "paths": {
+        "output_dir": "outputs",
+        "temp_dir": "temp",
+        "logs_dir": "logs"
+    },
+    "logging": {
+        "level": "INFO",
+        "log_frames": false
+    }
+}

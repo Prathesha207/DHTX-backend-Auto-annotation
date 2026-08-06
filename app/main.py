@@ -12,6 +12,12 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import os
+# Suppress OpenCV FFmpeg tracebacks for corrupted files
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "0"
+
+
 from contextlib import asynccontextmanager
 import asyncio
 import os
@@ -28,8 +34,9 @@ from app.models import (
     batch,
     video_run,
     cycle,
-    log,
     inference_config,
+    log,
+    job_session_state,
 )
 
 # Import routers
@@ -41,11 +48,35 @@ from app.routes import (
     upload,
     ws,
     settings,
+    session,
+    health,
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.core.startup_validation import validate_startup
+    if not validate_startup():
+        print("[FATAL] Startup validation failed. Exiting.")
+        os._exit(1)
+
+    # 1. Create and Validate Runtime Folders
+    from pathlib import Path
+    BASE_DIR = Path(__file__).resolve().parents[1]
+    runtime_dirs = ['logs', 'uploads', 'outputs', 'temp', 'inspection_logs', 'processed_videos']
+    
+    for d in runtime_dirs:
+        dir_path = BASE_DIR / d
+        dir_path.mkdir(parents=True, exist_ok=True)
+        # Verify write permissions
+        try:
+            test_file = dir_path / '.write_test'
+            test_file.touch()
+            test_file.unlink()
+        except Exception as e:
+            print(f"[FATAL] Cannot write to required directory {dir_path}: {e}")
+            os._exit(1)
+
     Base.metadata.create_all(bind=engine)
 
     # Seed inference configuration defaults
@@ -59,19 +90,33 @@ async def lifespan(app: FastAPI):
     from app.services.websocket_manager import manager
     manager.set_loop(asyncio.get_running_loop())   # ADD — fixes the crash
 
+    from app.services.health_monitor import health_monitor
+
     from app.services.model_manager import ModelManager
+    from app.services.excel_sync_service import ExcelSyncService
     from pathlib import Path
     
     BASE_DIR = Path(__file__).resolve().parents[1]
     MODEL_DIR = BASE_DIR / "models" / "ml"
     
-    # Initialize and load models once at startup
+    # Initialize and load models once at startup (in background to not block API)
+    import threading
     model_manager = ModelManager.get_instance()
-    model_manager.load_models(
-        seg_model_path=str(MODEL_DIR / "best_model_finetuned_manual.pth"),
-        yolo_socket_path=str(MODEL_DIR / "best.pt"),
-        pose_model_path=str(MODEL_DIR / "yolov8n-pose.pt")
-    )
+    def background_load():
+        try:
+            from app.core.config import SEGMENTATION_MODEL_NAME, POSE_MODEL_NAME, SOCKET_MODEL_NAME
+            seg_path = str(MODEL_DIR / SEGMENTATION_MODEL_NAME)
+            print(f"[STARTUP] INFO Loading segmentation model:\n{seg_path}")
+            model_manager.load_models(
+                seg_model_path=seg_path,
+                yolo_socket_path=str(MODEL_DIR / SOCKET_MODEL_NAME),
+                pose_model_path=str(MODEL_DIR / POSE_MODEL_NAME)
+            )
+            print("[STARTUP] INFO Segmentation model loaded successfully.")
+        except Exception as e:
+            print(f"[ModelManager] Failed to load models in background: {e}")
+            
+    threading.Thread(target=background_load, daemon=True).start()
 
 
     print("=" * 60)
@@ -79,8 +124,17 @@ async def lifespan(app: FastAPI):
     
     # Initialize background job queue
     from app.services.job_queue import job_queue
+    job_queue.start()
+    ExcelSyncService.get_instance().start()
+    health_monitor.start()
     
-    yield
+    try:
+        yield
+    finally:
+        ExcelSyncService.get_instance().flush()
+        ExcelSyncService.get_instance().stop()
+        job_queue.graceful_shutdown()
+        health_monitor.stop()
 
 app = FastAPI(
     title="DHTX Auto Annotation API",
@@ -162,6 +216,8 @@ app.include_router(logs.router)
 app.include_router(upload.router)
 app.include_router(ws.router)
 app.include_router(settings.router)
+app.include_router(session.router)
+app.include_router(health.router)
 
 os.makedirs("outputs", exist_ok=True)
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")

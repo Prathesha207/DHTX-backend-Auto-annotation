@@ -24,6 +24,10 @@ class VideoRun(Base):
 
     excel_report_path = Column(String)
 
+    file_size = Column(Integer)
+    
+    checksum = Column(String)
+
     queue_position = Column(Integer, nullable=False)
 
     status = Column(String, default="queued")
@@ -43,6 +47,8 @@ class VideoRun(Base):
     duration_seconds = Column(Float)
 
     error_message = Column(String)
+
+    interrupted_reason = Column(String, nullable=True)
 
     created_at = Column(String, nullable=False)
 

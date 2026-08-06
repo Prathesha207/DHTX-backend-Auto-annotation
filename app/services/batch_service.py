@@ -94,3 +94,31 @@ class BatchService:
         manager.send_threadsafe(batch.id, {"type": "finished"})
 
         return update_batch(db, batch)
+
+    @staticmethod
+    def cancel(
+        db: Session,
+        batch,
+    ):
+
+        batch.status = "cancelled"
+        batch.completed_at = datetime.now().isoformat()
+
+        manager.send_threadsafe(batch.id, {"type": "batch", "status": "cancelled"})
+        manager.send_threadsafe(batch.id, {"type": "finished"})
+
+        return update_batch(db, batch)
+
+    @staticmethod
+    def upload_timeout(
+        db: Session,
+        batch,
+    ):
+
+        batch.status = "upload_timeout"
+        batch.completed_at = datetime.now().isoformat()
+
+        manager.send_threadsafe(batch.id, {"type": "batch", "status": "upload_timeout"})
+        manager.send_threadsafe(batch.id, {"type": "finished"})
+
+        return update_batch(db, batch)

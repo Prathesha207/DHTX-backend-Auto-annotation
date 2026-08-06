@@ -18,8 +18,16 @@ from app.dependencies import get_db
 from app.services.upload_service import UploadService
 from app.services.batch_service import BatchService
 from app.services.video_run_service import VideoRunService
+from app.crud.inference_config import get_config
 
 from app.video_metadata import probe_video
+
+from pydantic import BaseModel
+import fastapi.responses
+
+class BatchCreateRequest(BaseModel):
+    batch_name: str | None = None
+    total_videos: int
 
 router = APIRouter(
     prefix="/upload",
@@ -38,6 +46,7 @@ ALLOWED_VIDEO_EXTENSIONS = {
 class LocalFolderRequest(BaseModel):
     folder_path: str
     batch_name: str | None = None
+    output_path: str | None = None
 
 
 @router.post(
@@ -47,6 +56,7 @@ class LocalFolderRequest(BaseModel):
 def upload_video(
     file: UploadFile = File(...),
     batch_name: str | None = Form(default=None),
+    output_path: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
 
@@ -62,7 +72,7 @@ def upload_video(
         metadata = probe_video(saved_path)
 
         output_dir = UploadService.create_batch_output_directory(
-            OUTPUT_DIR,
+            output_path or get_config(db).default_output_dir,
         )
 
         batch = BatchService.create(
@@ -118,6 +128,7 @@ def upload_video(
 def upload_folder(
     files: List[UploadFile] = File(...),
     batch_name: str | None = Form(default=None),
+    output_path: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
 
@@ -134,7 +145,7 @@ def upload_folder(
     )
 
     output_dir = UploadService.create_batch_output_directory(
-        OUTPUT_DIR,
+        output_path or get_config(db).default_output_dir,
     )
 
     batch = BatchService.create(
@@ -226,7 +237,7 @@ def upload_local_folder(
             detail="No supported video or image files found in the selected folder.",
         )
 
-    output_dir = UploadService.create_batch_output_directory(OUTPUT_DIR)
+    output_dir = UploadService.create_batch_output_directory(request.output_path or get_config(db).default_output_dir)
 
     batch = BatchService.create(
         db=db,
@@ -289,6 +300,7 @@ def upload_local_video(
     """
     file_path_str = request.get("file_path")
     batch_name_val = request.get("batch_name")
+    output_path_val = request.get("output_path")
 
     if not file_path_str:
         raise HTTPException(status_code=400, detail="file_path is required")
@@ -309,7 +321,7 @@ def upload_local_video(
     except Exception:
         metadata = {"width": 0, "height": 0, "fps": 0, "duration_seconds": 0, "total_frames": 0}
 
-    output_dir = UploadService.create_batch_output_directory(OUTPUT_DIR)
+    output_dir = UploadService.create_batch_output_directory(output_path_val or get_config(db).default_output_dir)
 
     batch = BatchService.create(
         db=db,
@@ -346,4 +358,127 @@ def upload_local_video(
         "batch_name": Path(batch.output_path).name if batch.output_path else None,
         "video_run_id": video.id,
         "message": "Local video registered successfully",
-    }
+    }
+
+
+@router.post(
+    "/batch/create",
+    status_code=status.HTTP_201_CREATED,
+)
+def create_batch(
+    request: BatchCreateRequest,
+    db: Session = Depends(get_db),
+):
+    from app.crud.inference_config import get_config
+    output_dir = UploadService.create_batch_output_directory(get_config(db).default_output_dir)
+
+    batch = BatchService.create(
+        db=db,
+        batch_name=request.batch_name,
+        input_type="folder",
+        input_path="",
+        output_path=output_dir,
+        total_videos=request.total_videos,
+    )
+    return {"batch_id": batch.id}
+
+@router.post(
+    "/batch/{batch_id}/file",
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_batch_file(
+    batch_id: int,
+    queue_position: int = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    from app.models.batch import Batch
+    batch = db.query(Batch).filter(Batch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    saved_info = UploadService.save_video(file=file, upload_root=UPLOAD_DIR)
+    saved_path = saved_info["path"]
+    sanitized_name = saved_info["original_name"]
+
+    try:
+        metadata = probe_video(saved_path)
+    except Exception as e:
+        video = VideoRunService.create(
+            db=db,
+            batch_id=batch.id,
+            input_filename=sanitized_name,
+            input_path=saved_path,
+            queue_position=queue_position,
+            file_size=saved_info.get("file_size"),
+            checksum=saved_info.get("checksum"),
+        )
+        VideoRunService.fail(db, video, error_message=str(e), status="failed_upload")
+        return fastapi.responses.JSONResponse(
+            status_code=422,
+            content={
+                "accepted": False,
+                "status": "FAILED_UPLOAD",
+                "reason": str(e),
+                "video_run_id": video.id
+            }
+        )
+
+    video = VideoRunService.create(
+        db=db,
+        batch_id=batch.id,
+        input_filename=sanitized_name,
+        input_path=saved_path,
+        queue_position=queue_position,
+        file_size=saved_info.get("file_size"),
+        checksum=saved_info.get("checksum"),
+    )
+
+    VideoRunService.update_metadata(
+        db=db,
+        video=video,
+        width=metadata["width"],
+        height=metadata["height"],
+        fps=metadata["fps"],
+        duration_seconds=metadata["duration_seconds"],
+    )
+
+    video.total_frames = metadata["total_frames"]
+    
+    if queue_position == 1 and not batch.input_path:
+        batch.input_path = str(Path(saved_path).parent)
+        
+    db.commit()
+    db.refresh(video)
+
+    return {
+        "batch_id": batch.id,
+        "video_run_id": video.id,
+        "queue_position": queue_position,
+        "message": "Video attached to batch successfully",
+    }
+
+
+@router.get(
+    "/batch/{batch_id}/manifest",
+    status_code=status.HTTP_200_OK,
+)
+def get_batch_manifest(
+    batch_id: int,
+    db: Session = Depends(get_db),
+):
+    from app.models.batch import Batch
+    from app.models.video_run import VideoRun
+    batch = db.query(Batch).filter(Batch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    runs = db.query(VideoRun).filter(VideoRun.batch_id == batch_id).all()
+    uploaded = [{"original_filename": r.input_filename, "status": r.status} for r in runs if r.status != "failed_upload"]
+    
+    return {
+        "accepted": True,
+        "batch_id": batch.id,
+        "uploaded_files": uploaded
+    }
+

@@ -1,0 +1,11 @@
+{
+    "name": "DHTX Inspection",
+    "plugin_version": "1.0.0",
+    "api_version": 1,
+    "author": "ML Team",
+    "supported_models": [
+        "socket",
+        "hand",
+        "tube"
+    ]
+}

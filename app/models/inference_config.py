@@ -25,6 +25,18 @@ class InferenceConfig(Base):
     # ── Logging toggles ──────────────────────────────────────────
     enable_debug_logging = Column(Boolean, nullable=False, default=False)
     enable_perf_logging = Column(Boolean, nullable=False, default=True)
+    
+    # ── Operational Settings ──────────────────────────────────────
+    upload_timeout_seconds = Column(Integer, nullable=False, default=300)
+    # ── Watchdog ──────────────────────────────────────────────────
+    watchdog_enabled = Column(Boolean, nullable=False, default=True)
+    watchdog_warning_seconds = Column(Integer, nullable=False, default=30)
+    watchdog_fail_seconds = Column(Integer, nullable=False, default=60)
+    
+    # ── Streaming ─────────────────────────────────────────────────
+    preview_fps = Column(Integer, nullable=False, default=20)
+    
+    default_output_dir = Column(String, nullable=False, default="outputs")
 
     # ── Timestamps ───────────────────────────────────────────────
     created_at = Column(String)

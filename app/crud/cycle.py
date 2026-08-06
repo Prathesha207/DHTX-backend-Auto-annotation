@@ -5,14 +5,13 @@ from app.models.cycle import Cycle
 
 def create_cycle(
     db: Session,
-    *,
     video_run_id: int,
     cycle_number: int,
     start_frame: int | None = None,
     end_frame: int | None = None,
     duration_seconds: float | None = None,
-    final_verdict: str,
-    output_video_path: str,
+    final_verdict: str = "PENDING",
+    output_video_path: str = "",
     tube_blue: str | None = None,
     transition_middle: str | None = None,
     transition_end: str | None = None,
@@ -108,3 +107,25 @@ def delete_cycle(
 
     db.delete(cycle)
     db.commit()
+
+
+def update_cycle(
+    db: Session,
+    cycle_id: int,
+    final_verdict: str,
+    anomaly_ratio: float = 0.0,
+    normal_votes: int = 0,
+    anomaly_votes: int = 0,
+) -> Cycle | None:
+    cycle = db.query(Cycle).filter(Cycle.id == cycle_id).first()
+    if not cycle:
+        return None
+    
+    cycle.final_verdict = final_verdict
+    cycle.anomaly_ratio = anomaly_ratio
+    cycle.ok_votes = normal_votes
+    cycle.anomaly_votes = anomaly_votes
+    
+    db.commit()
+    db.refresh(cycle)
+    return cycle

@@ -29,8 +29,12 @@ async def websocket_endpoint(
             heartbeat_mgr.record_heartbeat(websocket)
             try:
                 data_json = json.loads(data_text)
-                if isinstance(data_json, dict) and str(data_json.get("type")).upper() == "PING":
-                    await websocket.send_json({"type": "PONG"})
+                if isinstance(data_json, dict):
+                    msg_type = str(data_json.get("type")).upper()
+                    if msg_type == "PING":
+                        await websocket.send_json({"type": "PONG"})
+                    elif msg_type == "TOGGLE_ROI":
+                        job_session_mgr.set_show_roi(batch_id, data_json.get("show_roi", False))
             except Exception:
                 if data_text.strip().upper() == "PING":
                     await websocket.send_text("PONG")

@@ -5,10 +5,10 @@ import segmentation_models_pytorch as smp
 import sys
 from pathlib import Path
 
-# Ensure the models module can be imported
-sys.path.append(str(Path(__file__).resolve().parents[2]))
+# Ensure the models module can be imported, prioritizing it over any local app.models
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from app.services.ml_adapter import (
+from models.inference_video_full_detection import (  # type: ignore
     load_yolo, 
     detect_in_channels_from_ckpt, 
     NUM_CLASSES, 
@@ -19,11 +19,13 @@ class ModelManager:
     _instance = None
 
     def __init__(self):
+        import threading
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.seg_net = None
         self.yolo_socket = None
         self.yolo_pose = None
-        self.loaded = False
+        self.is_ready = threading.Event()
+        self.lock = threading.Lock()
 
     @classmethod
     def get_instance(cls):
@@ -31,21 +33,27 @@ class ModelManager:
             cls._instance = cls()
         return cls._instance
 
+    def wait_for_models(self):
+        self.is_ready.wait()
+
     def load_models(self, seg_model_path: str, yolo_socket_path: str, pose_model_path: str):
-        if self.loaded:
+        if self.is_ready.is_set():
             return
+        
+        with self.lock:
+            if self.is_ready.is_set():
+                return
 
         print(f"[ModelManager] Selected device: {self.device}")
         if self.device == "cuda":
             print(f"[ModelManager] GPU Name: {torch.cuda.get_device_name(0)}")
-            print(f"[ModelManager] CUDA Version: {torch.version.cuda}")
+            print(f"[ModelManager] CUDA Version: {torch.version.cuda}")  # type: ignore
         
         # ── Critical: Initialize all GPU globals in the engine module properly ──
         # This calls resolve_device() which sets DEVICE, USE_HALF, _NORM_MEAN, _NORM_STD,
         # enables cudnn.benchmark, TF32 matmul — same path as the standalone script.
-        import app.services.ml_adapter as inf_mod
-        engine = inf_mod.engine
-
+        import models.inference_video_full_detection as engine  # type: ignore
+        
         # Check Pascal GPU (GTX 10xx) — FP16 is slower than FP32 on sm_6x
         use_half = True
         if self.device == "cuda":
@@ -54,8 +62,11 @@ class ModelManager:
                 print(f"  [ModelManager] GPU sm_{cap[0]}{cap[1]} (Pascal or older): disabling FP16 for speed.")
                 use_half = False
 
-        # Use the engine's resolve_device to set DEVICE + all GPU norm tensors properly
-        resolved_device = engine.resolve_device(require_gpu=False)
+        # Use the manager's device directly
+        resolved_device = self.device
+        if hasattr(engine, 'resolve_device'):
+            resolved_device = engine.resolve_device(require_gpu=False)
+            
         engine.DEVICE = resolved_device
         engine.USE_HALF = use_half and resolved_device.startswith("cuda")
         self.device = resolved_device  # keep in sync
@@ -77,12 +88,21 @@ class ModelManager:
         ).to(self.device)
         ckpt = torch.load(seg_model_path, map_location=self.device, weights_only=False)
         self.seg_net.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
+        # Properly check if we should use half precision
+        use_half = self.device.startswith("cuda")
+        if use_half:
+            cap = torch.cuda.get_device_capability(0)
+            if cap[0] < 7:
+                use_half = False
+                
+        if use_half:
+            self.seg_net = self.seg_net.half()
         self.seg_net.eval()
 
         # Warm up: run one dummy forward pass so cuDNN autotunes kernels before real inference
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, *IMG_SIZE, device=self.device)
-            if engine.USE_HALF:
+            if use_half:
                 dummy = dummy.half()
             self.seg_net(dummy)
         print(f"[ModelManager] SegNet loaded on: {next(self.seg_net.parameters()).device}")
@@ -97,16 +117,20 @@ class ModelManager:
         if self.yolo_pose:
             print(f"[ModelManager] YOLO Pose loaded on: {self.yolo_pose.device}")
         
-        self.loaded = True
+        self.is_ready.set()
         print("[ModelManager] All models loaded and GPU-ready.")
 
     def get_models(self):
-        if not self.loaded:
-            BASE_DIR = Path(__file__).resolve().parents[2]
-            MODEL_DIR = BASE_DIR / "models" / "ml"
-            self.load_models(
-                seg_model_path=str(MODEL_DIR / "best_model_finetuned_manual.pth"),
-                yolo_socket_path=str(MODEL_DIR / "best.pt"),
-                pose_model_path=str(MODEL_DIR / "yolov8n-pose.pt")
-            )
+        if not self.is_ready.is_set():
+            try:
+                from app.core.config import SEGMENTATION_MODEL_NAME, POSE_MODEL_NAME, SOCKET_MODEL_NAME
+                BASE_DIR = Path(__file__).resolve().parents[2]
+                MODEL_DIR = BASE_DIR / "models" / "ml"
+                self.load_models(
+                    seg_model_path=str(MODEL_DIR / SEGMENTATION_MODEL_NAME),
+                    yolo_socket_path=str(MODEL_DIR / SOCKET_MODEL_NAME),
+                    pose_model_path=str(MODEL_DIR / POSE_MODEL_NAME)
+                )
+            except Exception as e:
+                print(f"[ModelManager] Auto-load failed: {e}")
         return self.seg_net, self.yolo_socket, self.yolo_pose

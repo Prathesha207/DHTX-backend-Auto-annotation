@@ -67,3 +67,33 @@ def update_inference_config(
 def restore_inference_config(db: Session = Depends(get_db)):
     """Restores the database configuration to backend defaults."""
     return update_config(db, **_DEFAULTS)
+
+@router.get("/browse-directory")
+def browse_directory():
+    """Opens a native directory selection dialog and returns the selected path."""
+    import tkinter as tk
+    from tkinter import filedialog
+    import threading
+    
+    result_path = {"path": None}
+    
+    def open_dialog():
+        root = tk.Tk()
+        root.withdraw()
+        # Ensure it comes to front
+        root.attributes('-topmost', True)
+        folder_path = filedialog.askdirectory(parent=root, title="Select Output Directory")
+        if folder_path:
+            import os
+            result_path["path"] = os.path.normpath(folder_path)
+        root.destroy()
+        
+    t = threading.Thread(target=open_dialog)
+    t.start()
+    t.join()
+    
+    if result_path["path"]:
+        return {"path": result_path["path"]}
+    else:
+        raise HTTPException(status_code=400, detail="No directory selected")
+

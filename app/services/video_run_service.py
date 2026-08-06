@@ -20,6 +20,8 @@ class VideoRunService:
         input_filename: str,
         input_path: str,
         queue_position: int,
+        file_size: int = None,
+        checksum: str = None,
     ):
 
         return create_video_run(
@@ -28,6 +30,8 @@ class VideoRunService:
             input_filename=input_filename,
             input_path=input_path,
             queue_position=queue_position,
+            file_size=file_size,
+            checksum=checksum,
             created_at=datetime.now().isoformat(),
         )
 
@@ -158,9 +162,10 @@ class VideoRunService:
         video,
         *,
         error_message: str,
+        status: str = "failed_inference"
     ):
 
-        video.status = "failed"
+        video.status = status
         video.error_message = error_message
         video.completed_at = datetime.now().isoformat()
 
