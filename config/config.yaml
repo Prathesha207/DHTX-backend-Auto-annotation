@@ -1,0 +1,170 @@
+# ==============================================================================
+#  Diagnostic Inference Engine Configuration (config.yaml)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Model & Video Paths
+# ------------------------------------------------------------------------------
+paths:
+  video_path: "data/raw/video.mp4"
+  seg_model_path: "ml/models/best_model_optimized.pth"
+  socket_model_path: "ml/models/best.pt"
+  hand_pose_path: "ml/models/yolov8n-pose.pt"
+  out_base: "storage/processed"
+
+# ------------------------------------------------------------------------------
+# 2. Hardware & Device Execution Settings
+# ------------------------------------------------------------------------------
+device:
+  require_gpu: false              # Require CUDA GPU execution
+  use_half: false                 # Run FP16 half precision on CUDA
+  gpu_warmup_hw: [720, 1280]      # Dummy frame H W for GPU warmup
+  opt_flow_downscale: 0.5         # Downscale factor for optical flow (0.5 = 2x speedup)
+
+# ------------------------------------------------------------------------------
+# 3. Socket Detection Parameters (run_model_socket)
+# ------------------------------------------------------------------------------
+socket:
+  conf_thr: 0.35                  # YOLO confidence threshold for socket detection
+  cls_no_socket: 0                # Class ID for 'no socket'
+  cls_socket: 1                   # Class ID for 'socket'
+  reset_grace_frames: 45          # Consecutive 'no socket' frames to close cycle
+  box_fill_alpha: 0.28            # Translucent fill opacity for socket bounding box
+
+# ------------------------------------------------------------------------------
+# 4. Hand / Operator Detection Parameters (run_hand_model)
+# ------------------------------------------------------------------------------
+hand:
+  pose_conf_thr: 0.40             # Confidence threshold for wrist/elbow keypoints
+  motion_thr: 3.5                 # Per-pixel optical flow magnitude (px/frame)
+  motion_frac: 0.06               # Fraction of ROI area with motion to trigger HAND state
+
+# ------------------------------------------------------------------------------
+# 5. ROI Subsystem Parameters (Socket ROI, Perf ROI, Mask ROI & Exclusion Zone)
+# ------------------------------------------------------------------------------
+roi:
+  # Socket bounding ROI expansion padding
+  pad_x: 180
+  pad_y: 160
+
+  # Performance bounding ROI (bounds CPU morphology / flow operations)
+  perf_roi_enabled: true
+  perf_roi_pad: 550
+
+  # Socket-adjacent Keep-Region Mask ROI Gate
+  mask_roi_shape: "quad_ellipse"  # circle, square, ellipse, quad_ellipse, polygon
+  mask_roi_radius: 160
+  mask_roi_radius_x: 160
+  mask_roi_radius_y: 330
+  mask_roi_offset_x: 0
+  mask_roi_offset_y: -120
+
+  # Asymmetric Quad-Ellipse radii (fixed pixel fallbacks)
+  mask_roi_radius_up: 330
+  mask_roi_radius_down: 120
+  mask_roi_radius_left: 160
+  mask_roi_radius_right: 220
+
+  # Auto-scaling multipliers relative to socket bbox dimensions
+  mask_roi_auto_scale: true
+  mask_roi_mult_up: 1.3
+  mask_roi_mult_down: 0.65
+  mask_roi_mult_left: 0.75
+  mask_roi_mult_right: 1.05
+  mask_roi_polygon: null          # Optional list of [dx, dy] points for polygon mode
+  mask_roi_classes: [2, 3, 4]
+
+  # Hard Mask Exclusion Zone (Keep-Out)
+  mask_exclude_enabled: true
+  mask_exclude_auto_scale: true
+  mask_exclude_offset_mult_x: -1.3
+  mask_exclude_offset_mult_y: -0.9
+  mask_exclude_radius_mult_x: 1.1
+  mask_exclude_radius_mult_y: 1.1
+  mask_exclude_offset_x: -250
+  mask_exclude_offset_y: -150
+  mask_exclude_radius_x: 200
+  mask_exclude_radius_y: 200
+  mask_exclude_classes: [2, 3, 4]
+
+# ------------------------------------------------------------------------------
+# 6. Tube Segmentation Parameters (run_model_tube_segmentation)
+# ------------------------------------------------------------------------------
+seg:
+  num_classes: 5
+  img_size: [512, 512]
+  overlay_alpha: 0.90             # Opacity of segmentation mask overlay
+  show_mask_overlay: true         # Render color overlays on video frames
+  ema_alpha: 0.20                 # Temporal EMA smoothing factor
+  boundary_sharpening: false      # Generalized 3-way boundary sharpening
+  sharpen_temp: 0.85
+
+  # Per-class confidence thresholds
+  class_conf_thr:
+    1: 0.35                       # Device
+    2: 0.25                       # Yellow (tube_blue)
+    3: 0.25                       # Blue (trans_mid_tube)
+    4: 0.25                       # Pink (trans_end_tube)
+
+  warmup_class_conf_thr:
+    1: 0.25
+    2: 0.20
+    3: 0.20
+    4: 0.20
+
+  # Flow-tracked 3-way Tube Identity Hysteresis Lock (FIX-I56)
+  identity_hysteresis_enabled: true
+  identity_ema_alpha: 0.15
+  tube_identity_margin: 0.06
+  tube_present_thr: 0.15
+  lock_engage_mode: "post_warmup" # post_warmup or immediate
+  locked_pixel_min_conf: 0.08
+
+  # Morphology & Dilation (Conflict-resolved Voronoi protection FIX-I54)
+  mask_dilate_enabled: true
+  mask_dilate_sz: 6
+  mask_dilate_classes: [2, 3, 4]
+  mask_close_enabled: true
+  mask_close_sz: 6
+
+  min_tube_px: 40
+  min_area_px: 120
+  morph_kernel_sz: 5
+  persist_frames: 1
+
+  # Channels
+  in_channels: 3                  # Auto-detected if null/omitted
+  use_radial_channel: false
+
+  # Mask Freeze (motion-gated re-inference)
+  mask_freeze_enabled: true
+  mask_freeze_motion_thr: 2.5
+  mask_freeze_motion_frac: 0.04
+  mask_debug: false
+
+  # HSV Gating
+  use_hsv_gate: false
+  hsv_ema_decay: 0.40
+
+# ------------------------------------------------------------------------------
+# 7. Inspection, Warmup & Verdict Evaluation Parameters
+# ------------------------------------------------------------------------------
+inspection:
+  warmup_frames: 20               # Frames to wait after socket detected before voting
+  max_warmup_retries: 3
+  verdict_thr: 0.50               # Ratio of anomaly votes to classify as ANOMALY
+  verdict_hold_sec: 2.0           # Seconds to hold the final verdict card at end of cycle
+  min_seq_stable: 3               # Consecutive frames sequence must remain unchanged
+  expected_seq: [2, 3, 4]         # Expected normal sequence (2: Yellow, 3: Blue, 4: Pink)
+  nearest_search_radius: 350      # Rectangular search half-side around socket center (px)
+  n_anomaly_confirm: 4            # Consecutive anomaly votes to confirm ANOMALY
+  latch_frames: 10                # Consecutive frames required to latch final result
+
+# ------------------------------------------------------------------------------
+# 8. User Interface & Reporting Settings
+# ------------------------------------------------------------------------------
+ui:
+  show_preview: true              # Display OpenCV live preview window
+  max_excel_retries: 5            # Max retry attempts if Excel file is locked
+  frame_ms_warn_threshold: 150.0  # Latency warning threshold in ms
+  frame_ms_ema_alpha: 0.12

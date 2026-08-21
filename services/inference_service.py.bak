@@ -1,0 +1,333 @@
+import os
+import threading
+from pathlib import Path
+import cv2
+import numpy as np
+from datetime import datetime as original_datetime_class
+
+# Import the ML team's code strictly without modifying it
+import ml.inference_video_full_detection as ml_pipeline
+from ml.inference_video_full_detection import run_single_video, PipelineConfig
+from services.frame_streamer import streamer
+
+_active_video_lock = threading.Lock()
+_active_video_id: str | None = None
+_stop_requested_ids = set()
+
+# Global registries
+_VALIDATORS = {}
+_THREAD_CONFIGS = {}
+
+class FrameValidator:
+    def __init__(self, model_settings: dict):
+        self.m1_total = model_settings.get("m1_total", 30)
+        self.m1_pass_req = model_settings.get("m1_pass", 18)
+        self.m2_total = model_settings.get("m2_total", 30)
+        self.m2_pass_req = model_settings.get("m2_pass", 18)
+        
+        if not (1 <= self.m1_pass_req <= self.m1_total):
+            raise ValueError("Model 1 pass_frames must be between 1 and total_frames")
+        if not (1 <= self.m2_pass_req <= self.m2_total):
+            raise ValueError("Model 2 pass_frames must be between 1 and total_frames")
+            
+        self.last_state = None
+        self.reset_cycle()
+        
+    def reset_cycle(self):
+        self.m1_frames = 0
+        self.m1_successes = 0
+        self.m1_passed = False
+        
+        self.m2_frames = 0
+        self.m2_successes = 0
+        self.m2_passed = False
+        self.m2_locked = True
+        self.validation_complete = False
+
+    def on_model1_frame(self, socket_detected, hand_in_roi):
+        if self.m1_passed:
+            return
+            
+        if hand_in_roi:
+            # Hand resets Model 1's current window
+            self.m1_frames = 0
+            self.m1_successes = 0
+            return
+            
+        self.m1_frames += 1
+        if socket_detected:
+            self.m1_successes += 1
+            
+        if self.m1_successes >= self.m1_pass_req:
+            self.m1_passed = True
+            self.m2_locked = False
+        elif self.m1_frames >= self.m1_total:
+            # Reached total frames without passing, reset window
+            self.m1_frames = 0
+            self.m1_successes = 0
+
+    def on_model2_frame(self, order_status, hand_in_roi):
+        if self.m2_locked or self.validation_complete:
+            return
+            
+        if hand_in_roi:
+            # Hand skips the frame, does NOT reset count
+            return
+            
+        self.m2_frames += 1
+        if order_status in ("OK", "ANOMALY"):
+            self.m2_successes += 1
+            
+        if self.m2_successes >= self.m2_pass_req:
+            self.m2_passed = True
+            self.validation_complete = True
+        elif self.m2_frames >= self.m2_total:
+            # Reached total frames without passing, reset window
+            self.m2_frames = 0
+            self.m2_successes = 0
+
+
+# --- GLOBAL HOOKS INSTALLED ONCE ---
+
+class MockNow:
+    def strftime(self, fmt):
+        if fmt == "%Y-%m-%d":
+            return ""  # Skip creating extra date folder
+        return original_datetime_class.now().strftime(fmt)
+
+class MockDatetime(original_datetime_class):
+    @classmethod
+    def now(cls, tz=None):
+        return MockNow()
+
+# Save originals
+original_datetime = ml_pipeline.datetime
+original_video_capture_read = cv2.VideoCapture.read
+original_run_model_tube_segmentation = ml_pipeline.run_model_tube_segmentation
+original_draw_seg_overlay = ml_pipeline.draw_seg_overlay
+original_draw_hud = ml_pipeline.draw_hud
+original_end_cycle = ml_pipeline.CycleManager.end_cycle
+_global_shutdown = False
+
+def request_global_shutdown():
+    global _global_shutdown
+    _global_shutdown = True
+
+def hooked_read(self_cap):
+    with _active_video_lock:
+        cancel = False
+        if _active_video_id and _active_video_id in _stop_requested_ids:
+            cancel = True
+    if cancel or _global_shutdown:
+        print(f"🛑 Intercepted frame read: terminating ML loop cleanly.")
+        return False, None
+    return original_video_capture_read(self_cap)
+def hooked_draw_seg_overlay(frame, pred_map, alpha=0.90):
+    thread_id = threading.get_ident()
+    config_id = _THREAD_CONFIGS.get(thread_id)
+    validator = _VALIDATORS.get(config_id) if config_id else None
+    
+    if validator and not validator.m1_passed:
+        # Don't visually draw the mask if Model 1 hasn't passed!
+        return frame
+        
+    return original_draw_seg_overlay(frame, pred_map, alpha)
+
+def hooked_draw_hud(*args, **kwargs):
+    frame = args[0]
+    fps = args[1] if len(args) > 1 else kwargs.get("fps", 0)
+    frame_idx = args[2] if len(args) > 2 else kwargs.get("frame_idx", 0)
+    state = args[3] if len(args) > 3 else kwargs.get("state", "IDLE")
+    socket_detected = args[4] if len(args) > 4 else kwargs.get("sock_hit")
+    order_status = args[6] if len(args) > 6 else kwargs.get("order_status")
+    
+    hand_in_roi = kwargs.get("hand_in_roi", False)
+    cycle_no = kwargs.get("cycle_no", 0)
+    
+    config = kwargs.get("config")
+    validator = None
+    
+    if config:
+        validator = _VALIDATORS.get(id(config))
+        if validator:
+            cls_socket = config.socket.cls_socket
+            is_valid_socket = (socket_detected is not None and socket_detected["class"] == cls_socket)
+            
+            if state == getattr(ml_pipeline, 'STATE_IDLE', 'IDLE'): 
+                if validator.last_state != getattr(ml_pipeline, 'STATE_IDLE', 'IDLE'):
+                    validator.reset_cycle()
+            else:
+                validator.on_model1_frame(is_valid_socket, hand_in_roi)
+                if state != getattr(ml_pipeline, 'STATE_WARMUP', 'WARMUP'):
+                    validator.on_model2_frame(order_status, hand_in_roi)
+                
+            validator.last_state = state
+
+    # Extract voting metrics if available
+    vote_counter = kwargs.get("vote_counter")
+    verdict = "UNKNOWN"
+    if vote_counter:
+        try:
+            verdict = vote_counter.final_verdict()
+        except:
+            pass
+    total_frames_val = kwargs.get("total_frames", 0)
+    if frame_idx % 30 == 0:
+        print(f"DEBUG: hooked_draw_hud frame={frame_idx}, total_frames={total_frames_val}")
+
+    # Build telemetry payload
+    telemetry = {
+        "video_id": get_active_video(),
+        "video": {
+            "frame": int(frame_idx),
+            "total_frames": int(total_frames_val),
+            "fps": float(round(fps, 1)),
+            "frame_ms": float(kwargs.get("frame_ms", 0.0)),
+            "frame_ms_avg": float(kwargs.get("frame_ms_avg", 0.0)),
+        },
+        "cycle": {
+            "number": int(cycle_no),
+            "state": str(state),
+            "verdict": verdict
+        },
+        "socket": {
+            "present": bool(socket_detected is not None)
+        },
+        "hand": {
+            "detected": bool(hand_in_roi),
+            "in_roi": bool(hand_in_roi)
+        },
+        "tube": {
+            "order_status": str(order_status)
+        },
+        "models": {
+            "model_1": {
+                "purpose": "SOCKET_DETECTION",
+                "frames_processed": int(validator.m1_frames if validator else 0),
+                "success_frames": int(validator.m1_successes if validator else 0),
+                "passed": bool(validator.m1_passed if validator else False),
+                "pass_req": int(validator.m1_pass_req if validator else 0),
+                "total_req": int(validator.m1_total if validator else 0)
+            },
+            "model_2": {
+                "purpose": "INSPECTION",
+                "frames_processed": int(validator.m2_frames if validator else 0),
+                "success_frames": int(validator.m2_successes if validator else 0),
+                "passed": bool(validator.m2_passed if validator else False),
+                "pass_req": int(validator.m2_pass_req if validator else 0),
+                "total_req": int(validator.m2_total if validator else 0)
+            }
+        }
+    }
+    
+    # Push clean frame and telemetry to background encoder thread
+    streamer.push(frame, telemetry)
+
+    # Return clean frame without burning HUD text
+    return frame
+
+def hooked_draw_production_status_bar(*args, **kwargs):
+    # Return clean frame without burning the top status bar
+    return args[0]
+
+def hooked_end_cycle(self, final_verdict, extra_metrics=None):
+    thread_id = threading.get_ident()
+    config_id = _THREAD_CONFIGS.get(thread_id)
+    validator = _VALIDATORS.get(config_id) if config_id else None
+    
+    if validator and not validator.validation_complete:
+        # Aborted validation attempt. User wants to log this as UNKNOWN!
+        print("⚠️ Validation aborted: Logging as UNKNOWN.")
+        return original_end_cycle(self, "UNKNOWN", extra_metrics)
+        
+    return original_end_cycle(self, final_verdict, extra_metrics)
+
+
+# Install hooks permanently at module initialization
+ml_pipeline.datetime = MockDatetime
+cv2.VideoCapture.read = hooked_read
+ml_pipeline.draw_seg_overlay = hooked_draw_seg_overlay
+ml_pipeline.draw_hud = hooked_draw_hud
+ml_pipeline.draw_production_status_bar = hooked_draw_production_status_bar
+ml_pipeline.CycleManager.end_cycle = hooked_end_cycle
+
+
+# --- API FUNCTIONS ---
+
+def set_active_video(video_id: str | None):
+    global _active_video_id
+    with _active_video_lock:
+        _active_video_id = video_id
+
+def get_active_video() -> str | None:
+    with _active_video_lock:
+        return _active_video_id
+
+def request_stop_inference(video_id: str | None = None) -> bool:
+    global _stop_requested_ids
+    with _active_video_lock:
+        target_id = video_id or _active_video_id
+        if target_id:
+            _stop_requested_ids.add(target_id)
+            print(f"🛑 Stop requested for video {target_id}")
+            return True
+        return False
+
+def is_stop_requested(video_id: str | None = None) -> bool:
+    with _active_video_lock:
+        if video_id and video_id in _stop_requested_ids:
+            return True
+        if _active_video_id and _active_video_id in _stop_requested_ids:
+            return True
+        return False
+
+def clear_stop_request(video_id: str | None = None):
+    with _active_video_lock:
+        if video_id:
+            _stop_requested_ids.discard(video_id)
+        elif _active_video_id:
+            _stop_requested_ids.discard(_active_video_id)
+
+def run_inference(video_path: str, out_base_dir: str, video_id: str | None = None, model_settings: dict | None = None) -> bool:
+    base_dir = Path(__file__).resolve().parent.parent
+    yaml_path = base_dir / "config" / "config.yaml"
+    
+    config = PipelineConfig.from_yaml(str(yaml_path))
+    config.paths.video_path = video_path
+    config.paths.out_base = out_base_dir
+    config.ui.show_preview = False
+    config.device.require_gpu = False
+    config.device.use_half = False
+    
+    # Ensure model paths are absolute
+    def make_abs(p: str) -> str:
+        if not p: return p
+        path_obj = Path(p)
+        if path_obj.is_absolute():
+            return p
+        return str((base_dir / path_obj).resolve())
+        
+    config.paths.seg_model_path = make_abs(config.paths.seg_model_path)
+    config.paths.socket_model_path = make_abs(config.paths.socket_model_path)
+    config.paths.hand_pose_path = make_abs(config.paths.hand_pose_path)
+    
+    try:
+        set_active_video(video_id)
+        clear_stop_request(video_id)
+        # Register validator for this specific config instance
+        if model_settings:
+            _VALIDATORS[id(config)] = FrameValidator(model_settings)
+            _THREAD_CONFIGS[threading.get_ident()] = id(config)
+        run_single_video(
+            config=config,
+            print_summary=False,
+            enable_debug=False,
+            forced_channels=None
+        )
+    finally:
+        set_active_video(None)
+        if model_settings:
+            _VALIDATORS.pop(id(config), None)
+            _THREAD_CONFIGS.pop(threading.get_ident(), None)
+            
+    return not is_stop_requested(video_id)

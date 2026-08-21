@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Databases
+*.db
+sqlite.db
+dhtx.db
+
+# Storage & video outputs
+storage/
+processed/
+uploads/
+data/
+
+# Excel temporary files
+~$*.xlsx
+
+# Environment variables
+.env
+.env.local
