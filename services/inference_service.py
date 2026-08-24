@@ -515,7 +515,7 @@ def hooked_draw_hud(*args, **kwargs):
     frame_idx       = args[2] if len(args) > 2 else kwargs.get("frame_idx", 0)
     state           = args[3] if len(args) > 3 else kwargs.get("state", "IDLE")
     socket_detected = args[4] if len(args) > 4 else kwargs.get("sock_hit")
-    order_status    = kwargs.get("order_status")
+    order_status    = args[6] if len(args) > 6 else kwargs.get("order_status")
     hand_in_roi     = kwargs.get("hand_in_roi", False)
     cycle_no        = kwargs.get("cycle_no", 0)
     config          = kwargs.get("config")
