@@ -287,6 +287,7 @@ class AsyncVideoWriter:
     def write(self, frame: np.ndarray) -> None:
         with self._state_lock:
             if self._state != _WriterState.OPEN:
+                self.ctx.dropped_frames += 1
                 return  # silently discard after CLOSING/CLOSED/FAILED/STALLED
 
         # Snapshot overlay_data so the writer thread sees this exact frame's metadata
@@ -323,24 +324,27 @@ class AsyncVideoWriter:
         Idempotent — safe to call more than once.
         """
         with self._state_lock:
-            if self._state != _WriterState.OPEN:
-                return  # idempotent
+            if self._state in (_WriterState.CLOSED, _WriterState.CLOSING, _WriterState.STALLED):
+                return
+            
+            was_failed = (self._state == _WriterState.FAILED)
             self._state = _WriterState.CLOSING
 
         deadline = time.monotonic() + self.DRAIN_TIMEOUT
 
-        # 1. Enqueue sentinel with bounded wait
-        remaining = max(0.0, deadline - time.monotonic())
-        try:
-            self._q.put(None, timeout=remaining)
-        except queue.Full:
-            logger.critical(
-                "AsyncVideoWriter sentinel enqueue timed out: "
-                "video_id=%s thread=%s drain_timeout=%.1fs",
-                self.ctx.video_id, self._worker.name, self.DRAIN_TIMEOUT,
-            )
-            self._mark_stalled()
-            return
+        # 1. Enqueue sentinel with bounded wait (only if not failed)
+        if not was_failed:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                self._q.put(None, timeout=remaining)
+            except queue.Full:
+                logger.critical(
+                    "AsyncVideoWriter sentinel enqueue timed out: "
+                    "video_id=%s thread=%s drain_timeout=%.1fs",
+                    self.ctx.video_id, self._worker.name, self.DRAIN_TIMEOUT,
+                )
+                self._mark_stalled()
+                return
 
         # 2. Join worker thread with bounded wait
         remaining = max(0.0, deadline - time.monotonic())
@@ -511,7 +515,7 @@ def hooked_draw_hud(*args, **kwargs):
     frame_idx       = args[2] if len(args) > 2 else kwargs.get("frame_idx", 0)
     state           = args[3] if len(args) > 3 else kwargs.get("state", "IDLE")
     socket_detected = args[4] if len(args) > 4 else kwargs.get("sock_hit")
-    order_status    = args[6] if len(args) > 6 else kwargs.get("order_status")
+    order_status    = kwargs.get("order_status")
     hand_in_roi     = kwargs.get("hand_in_roi", False)
     cycle_no        = kwargs.get("cycle_no", 0)
     config          = kwargs.get("config")
@@ -857,14 +861,14 @@ def run_inference(
     out_base_dir:   str,
     video_id:       str | None  = None,
     model_settings: dict | None = None,
-) -> bool:
+) -> dict:
     """Run the ML inference pipeline for one video.
 
     Returns:
-        True  — inference completed normally AND writer succeeded.
-        False — video stopped by user, pipeline raised, or writer failed/stalled.
-
-    The context is ALWAYS cleaned up in the finally block regardless of outcome.
+        dict with keys:
+            - completed: bool (True if normal completion)
+            - verdict: str | None (NORMAL, ANOMALY, UNKNOWN, ABORTED)
+            - output_path: str | None (path to the saved video)
     """
     base_dir  = Path(__file__).resolve().parent.parent
     yaml_path = base_dir / "config" / "config.yaml"
@@ -873,8 +877,9 @@ def run_inference(
     config.paths.video_path    = video_path
     config.paths.out_base      = out_base_dir
     config.ui.show_preview     = False
-    config.device.require_gpu  = False
-    config.device.use_half     = False
+    
+    config.device.require_gpu  = config.device.require_gpu if hasattr(config.device, 'require_gpu') else True
+    config.device.use_half     = config.device.use_half if hasattr(config.device, 'use_half') else True
 
     def make_abs(p: str) -> str:
         if not p:
@@ -890,46 +895,98 @@ def run_inference(
 
     stopped      = False
     writer_error = None
+    final_verdict = None
+    final_output_path = None
+    written_frames = 0
+    dropped_frames = 0
 
     logger.info("Inference started: video_id=%s path=%s", video_id, video_path)
 
     try:
-        run_single_video(
+        cycles = run_single_video(
             config          = config,
             print_summary   = False,
             enable_debug    = False,
             forced_channels = None,
         )
+        
+        if cycles and hasattr(cycles, 'cycle_summaries') and cycles.cycle_summaries:
+            latch_frames = getattr(config.inspection, 'latch_frames', 10)
+            
+            # Apply latch validation override across all cycles first
+            for summary in cycles.cycle_summaries:
+                infer_frames = summary.get("infer_frames", 0)
+                verdict = summary.get("final_verdict")
+                old_path = summary.get("output_path")
+                
+                if infer_frames < latch_frames and verdict != "UNKNOWN" and old_path and os.path.exists(old_path):
+                    logger.warning("Video %s had only %d infer frames (min %d). Forcing UNKNOWN.", video_id, infer_frames, latch_frames)
+                    
+                    import os, shutil
+                    unknown_dir = Path(config.paths.out_base) / "UNKNOWN"
+                    unknown_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    old_name = os.path.basename(old_path)
+                    new_name = old_name.replace(f"_{verdict}_", "_UNKNOWN_")
+                    new_path = unknown_dir / new_name
+                    
+                    try:
+                        shutil.move(old_path, str(new_path))
+                        # Update the summary inline so the final extraction picks it up
+                        summary["final_verdict"] = "UNKNOWN"
+                        summary["output_path"] = str(new_path)
+                    except Exception as exc:
+                        logger.error("Could not move latch-failed file to UNKNOWN: %s", exc)
+
+            # Now strictly extract the final, authoritative result from the last cycle
+            last_summary = cycles.cycle_summaries[-1]
+            final_verdict = last_summary.get("final_verdict")
+            final_output_path = last_summary.get("output_path")
+
     except Exception:
         logger.exception("Inference pipeline raised: video_id=%s", video_id)
         raise
     finally:
-        # Capture context state BEFORE cleanup, regardless of how the pipeline exited
         stopped      = ctx.stop_requested.is_set()
         writer_error = ctx.writer_error
+        written_frames = ctx.written_frames
+        dropped_frames = ctx.dropped_frames
         cleanup_context(video_id)
-        # Remove this video's snapshot so stale frames aren't replayed
-        # to reconnecting browsers. Per-video — does not affect other videos.
         streamer.clear_snapshot(video_id)
+        
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
     if writer_error is not None:
         logger.error(
             "Inference completed but writer failed: video_id=%s error=%s",
             video_id, writer_error,
         )
-        return False
+        return {"completed": False, "verdict": "UNKNOWN", "output_path": None, "reason": "WRITER_FAILED"}
 
     if stopped:
         logger.info("Inference was stopped by user request: video_id=%s", video_id)
-        return False
+        return {"completed": False, "verdict": "ABORTED", "output_path": final_output_path, "reason": "STOP_REQUESTED"}
 
     logger.info(
         "Inference completed successfully: video_id=%s written=%d dropped=%d",
         video_id,
-        ctx.written_frames,
-        ctx.dropped_frames,
+        written_frames,
+        dropped_frames,
     )
-    return True
+    
+    if final_verdict == "UNKNOWN":
+        reason = "VALIDATION_INCOMPLETE"
+    else:
+        reason = None
+        
+    return {"completed": True, "verdict": final_verdict, "output_path": final_output_path, "reason": reason}
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -16,8 +16,8 @@ paths:
 # 2. Hardware & Device Execution Settings
 # ------------------------------------------------------------------------------
 device:
-  require_gpu: false              # Require CUDA GPU execution
-  use_half: false                 # Run FP16 half precision on CUDA
+  require_gpu: true               # Require CUDA GPU execution
+  use_half: true                  # Run FP16 half precision on CUDA
   gpu_warmup_hw: [720, 1280]      # Dummy frame H W for GPU warmup
   opt_flow_downscale: 0.5         # Downscale factor for optical flow (0.5 = 2x speedup)
 

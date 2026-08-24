@@ -55,11 +55,16 @@ async def startup_db_seed():
         db.close()
     
     # Phase 9: Crash recovery — reset any PROCESSING → QUEUED before starting worker
-    recover_interrupted_jobs()
+    recovered_ids = recover_interrupted_jobs()
 
     # Start the sequential background worker
     global inference_task
     inference_task = asyncio.create_task(inference_worker())
+    
+    # Enqueue recovered jobs directly from the asyncio context
+    from services.queue_service import inference_queue
+    for vid in recovered_ids:
+        inference_queue.put_nowait(vid)
     
     # Attach the active event loop to the frame streamer
     streamer.attach_loop(asyncio.get_running_loop())

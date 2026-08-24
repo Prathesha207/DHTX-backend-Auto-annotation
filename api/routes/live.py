@@ -60,16 +60,22 @@ class ConnectionManager:
                 # Wait for the next fully encoded payload from the streamer
                 payload = await streamer.ws_queue.get()
                 
-                # Send to all connected clients
-                dead_connections = []
-                for connection in self.active_connections:
+                # Send to all connected clients concurrently with a timeout to prevent hanging
+                async def send_to_client(connection):
                     try:
-                        await connection.send_json(payload)
+                        # 2-second timeout so a dead/frozen TCP connection won't block the loop forever
+                        await asyncio.wait_for(connection.send_json(payload), timeout=2.0)
+                        return None
                     except Exception:
-                        dead_connections.append(connection)
+                        return connection
+
+                # Fire all sends concurrently
+                results = await asyncio.gather(*(send_to_client(c) for c in self.active_connections))
                 
-                for dead in dead_connections:
-                    self.disconnect(dead)
+                # Any connection that returned itself had an error/timeout and is dead
+                for dead in results:
+                    if dead:
+                        self.disconnect(dead)
                     
             except asyncio.CancelledError:
                 break

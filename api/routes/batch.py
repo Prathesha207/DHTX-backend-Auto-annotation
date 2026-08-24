@@ -421,17 +421,28 @@ def retry_batch(
         .all()
     )
 
+    # Discard the batch from the cancelled set so inference can proceed
+    cancelled_batch_ids.discard(batch_id)
+
     count = 0
     enqueued_ids = []
+    from services.queue_service import cancelled_video_ids
     for v in videos:
         v.status = "QUEUED"
         v.verdict = None
         enqueued_ids.append(v.id)
+        cancelled_video_ids.discard(v.id)
         count += 1
     
     db.commit()
 
-    for vid in enqueued_ids:
-        inference_queue.put_nowait(vid)
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        for vid in enqueued_ids:
+            loop.call_soon_threadsafe(inference_queue.put_nowait, vid)
+    except RuntimeError:
+        for vid in enqueued_ids:
+            inference_queue.put_nowait(vid)
 
     return RetryResponse(re_queued=count)
