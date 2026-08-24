@@ -11,42 +11,50 @@ from services.inference_service import run_inference, request_stop_inference, is
 
 logger = logging.getLogger(__name__)
 
-INFERENCE_TIMEOUT_SECONDS = 60 * 30  # 30 minutes
-
+INFERENCE_TIMEOUT_SECONDS = 60 * 60  # 60 minutes (safe for CPU inference)
+CANCEL_GRACE_SECONDS = 3.0
 inference_queue = asyncio.Queue()
-cancelled_video_ids = set()
-cancelled_batch_ids = set()
+cancelled_video_ids: set[str] = set()
+cancelled_batch_ids: set[str] = set()
 
 
+# ── Ensure Storage Location ───────────────────────────
+# This function/class is responsible for ensure storage location operations.
+def ensure_storage_location(db) -> str:
+    """Ensure an active storage entry exists in DB and return its root_path."""
+    active = crud.get_active_storage(db)
+    if active and is_path_writable(active.root_path):
+        return active.root_path
+    
+    writable_dir = get_writable_default_location()
+    new_storage = crud.create_or_update_storage(db, root_path=writable_dir, is_default=True)
+    return new_storage.root_path
+
+
+# ── Recover Interrupted Jobs ──────────────────────────
+# This function/class is responsible for recover interrupted jobs operations.
 def recover_interrupted_jobs(is_shutdown: bool = False):
     """
-    Phase 9 — Crash recovery / Shutdown cleanup.
-    Any video that was left in PROCESSING status when the backend died or is shutting down
-    is reset back to QUEUED (and added to queue if not shutting down).
-    Also deletes any orphaned __processing__ files on disk.
+    Recovers videos stuck in 'PROCESSING' state across server restarts.
     """
     db = database.SessionLocal()
     try:
-        stuck = (
-            db.query(models.Video)
-            .filter(models.Video.status == "PROCESSING")
-            .order_by(models.Video.uploaded_at.asc())
-            .all()
-        )
+        stuck = db.query(models.Video).filter(models.Video.status == "PROCESSING").all()
         enqueued_ids = []
         for v in stuck:
             v.status = "QUEUED"
-            v.processing_started_at = None
             enqueued_ids.append(v.id)
             
-            # Clean up temporary in-progress cycle files for this stuck job
-            if v.batch and v.batch.storage:
-                out_base_dir = Path(v.batch.storage.root_path) / "processed" / v.batch.batch_date / f"batch_{v.batch.batch_number}"
+            # Clean up orphaned temporary files for this video
+            if v.batch:
+                active_storage = crud.get_active_storage(db)
+                storage_root = Path(active_storage.root_path if active_storage else "./storage")
+                out_base_dir = storage_root / "processed" / v.batch.batch_date / f"batch_{v.batch.batch_number}"
                 video_stem = Path(v.filename).stem
                 for f in out_base_dir.glob(f"__processing__{video_stem}_cycle*.mp4"):
                     try:
                         f.unlink()
-                        print(f"🧹 Cleaned up orphaned file on recovery: {f.name}")
+                        print(f"🧹 Cleaned up orphaned file: {f.name}")
                     except Exception as e:
                         print(f"⚠️ Failed to clean up {f.name}: {e}")
                         
@@ -78,8 +86,11 @@ def ensure_unknown_output(source_path: str, out_base_dir: Path, filename: str) -
         return None
 
 
-def update_excel_log_verdict(out_base_dir: Path, filename: str, verdict: str, output_path: str | None, only_if_missing: bool = False):
-    """Create or update the batch Excel log for an aborted, failed, or fallback video."""
+def update_excel_log_verdict(out_base_dir: Path, filename: str, verdict: str, output_path: str | None, only_if_missing: bool = True):
+    """
+    Create or update the batch Excel log for an aborted, failed, or fallback video.
+    PRESERVES existing cycle rows logged by the ML pipeline so valid cycles are never overwritten.
+    """
     try:
         import openpyxl
         from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -89,13 +100,16 @@ def update_excel_log_verdict(out_base_dir: Path, filename: str, verdict: str, ou
         excel_path = out_base_dir / "inspection_log.xlsx"
         headers = ["Sr No.", "Timestamp", "Cycle No.", "Video File", "Status", "Video Folder Saving Path"]
         fills = {
-            "NORMAL": ("C6EFCE", "006100"),
+            "NORMAL":  ("C6EFCE", "006100"),
             "ANOMALY": ("FFC7CE", "9C0006"),
             "ABORTED": ("FFE0B2", "B78103"),
             "UNKNOWN": ("FFEB9C", "9C6500"),
-            "FAILED": ("FFC7CE", "9C0006"),
+            "FAILED":  ("FFC7CE", "9C0006"),
             "TIMEOUT": ("FFEB9C", "9C6500"),
         }
+
+        thin = Side(style="thin", color="BFBFBF")
+        bdr = Border(left=thin, right=thin, top=thin, bottom=thin)
 
         if excel_path.exists():
             workbook = openpyxl.load_workbook(str(excel_path))
@@ -104,46 +118,60 @@ def update_excel_log_verdict(out_base_dir: Path, filename: str, verdict: str, ou
             workbook = openpyxl.Workbook()
             sheet = workbook.active
             sheet.title = "Inspection Log"
-            thin = Side(style="thin", color="BFBFBF")
             for column, header in enumerate(headers, 1):
                 cell = sheet.cell(row=1, column=column, value=header)
                 cell.font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
                 cell.fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-                cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = bdr
+            sheet.row_dimensions[1].height = 32
             sheet.freeze_panes = "A2"
 
-        fill_hex, text_hex = fills.get(verdict, ("F2F2F2", "000000"))
-        
-        # Check if this filename is already in the sheet
-        matched_rows = []
+        # Check if this filename already has valid entries in the sheet
+        has_existing_rows = False
         for row in range(2, sheet.max_row + 1):
             if sheet.cell(row=row, column=4).value == filename:
-                matched_rows.append(row)
+                has_existing_rows = True
+                break
 
-        if matched_rows:
-            if only_if_missing:
-                return
-            for row in matched_rows:
-                sheet.cell(row=row, column=5).value = verdict
-                sheet.cell(row=row, column=6).value = output_path or "N/A"
-                status_cell = sheet.cell(row=row, column=5)
-                status_cell.fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
-                status_cell.font = Font(name="Arial", size=10, bold=True, color=text_hex)
-        else:
+        if has_existing_rows and only_if_missing:
+            # Valid cycle row(s) already exist from the ML pipeline — do not overwrite them
+            return
+
+        fill_hex, text_hex = fills.get(verdict, ("F2F2F2", "000000"))
+
+        if not has_existing_rows:
             sr_no = max(1, sheet.max_row)
-            sheet.append([sr_no, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0,
-                          filename, verdict, output_path or "N/A"])
-            status_cell = sheet.cell(row=sheet.max_row, column=5)
-            status_cell.fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
-            status_cell.font = Font(name="Arial", size=10, bold=True, color=text_hex)
+            row_vals = [
+                sr_no,
+                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                0,
+                filename,
+                verdict,
+                output_path or "N/A"
+            ]
+            sheet.append(row_vals)
+            curr_row = sheet.max_row
+
+            for col_idx in range(1, len(headers) + 1):
+                c = sheet.cell(row=curr_row, column=col_idx)
+                c.font = Font(name="Arial", size=10)
+                c.border = bdr
+                c.alignment = Alignment(
+                    horizontal="center" if col_idx in (1, 2, 3, 5) else "left",
+                    vertical="center"
+                )
+                if col_idx == 5:
+                    c.fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
+                    c.font = Font(name="Arial", size=10, bold=True, color=text_hex)
 
         for column in range(1, len(headers) + 1):
             width = max(len(str(sheet.cell(row=row, column=column).value or ""))
-                        for row in range(1, sheet.max_row + 1)) + 2
+                        for row in range(1, sheet.max_row + 1)) + 4
             sheet.column_dimensions[get_column_letter(column)].width = max(14, width)
+
         workbook.save(str(excel_path))
-        print(f"📊 Updated Excel log row to {verdict}: {excel_path}")
+        print(f"📊 Excel log verified/updated: {excel_path}")
     except Exception as e:
         print(f"⚠️ Could not update Excel log: {e}")
 
