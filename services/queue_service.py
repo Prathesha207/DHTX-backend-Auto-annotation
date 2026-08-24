@@ -154,14 +154,23 @@ def update_excel_log_verdict(out_base_dir: Path, filename: str, verdict: str, ou
         target_row = sheet.max_row + 1
 
         sr_no = max((int(sheet.cell(row=r, column=1).value or 0) for r in range(2, sheet.max_row + 1)), default=0) + 1
-        sheet.append([sr_no, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0 if verdict in ["UNKNOWN", "FAILED"] else max_cycle + 1,
+        cycle_str = "-" if verdict in ["UNKNOWN", "FAILED", "ABORTED"] else max_cycle + 1
+        
+        sheet.append([sr_no, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), cycle_str,
                       filename, verdict, output_path or "N/A"])
                 
         status_cell = sheet.cell(row=target_row, column=5)
         status_cell.fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
         status_cell.font = Font(name="Arial", size=10, bold=True, color=text_hex)
 
+        thin = Side(style="thin", color="BFBFBF")
         for column in range(1, len(headers) + 1):
+            cell = sheet.cell(row=target_row, column=column)
+            if column != 5:
+                cell.font = Font(name="Arial", size=10)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            
             width = max(len(str(sheet.cell(row=row, column=column).value or ""))
                         for row in range(1, sheet.max_row + 1)) + 2
             sheet.column_dimensions[get_column_letter(column)].width = max(14, width)
