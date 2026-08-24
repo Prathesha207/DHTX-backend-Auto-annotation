@@ -460,7 +460,7 @@ _global_shutdown = False
 
 
 # ── Request Global Shutdown ───────────────────────────
-# This function/class is responsible for request global shutdown operations.
+# This function/class is responsible for Signals all active inference loops to terminate immediately during backend shutdown.
 def request_global_shutdown() -> None:
     global _global_shutdown
     _global_shutdown = True
@@ -485,7 +485,7 @@ def hooked_read(self_cap):
 
 
 # ── Hooked Draw Seg Overlay ───────────────────────────
-# This function/class is responsible for hooked draw seg overlay operations.
+# This function/class is responsible Signals all active inference loops to terminate immediately during backend shutdown.
 def hooked_draw_seg_overlay(frame, pred_map, alpha=0.90):
     """Suppresses segmentation overlay until Model 1 validation has passed."""
     ctx       = get_active_context()
@@ -550,7 +550,7 @@ def hooked_draw_hud(*args, **kwargs):
         frame_idx, total_frames_val, state, verdict,
     )
 
-    # ── Phase 7 — Snapshot OverlayData (Stage B renderer reads this) ──
+    # ──  \Snapshot OverlayData (Stage B renderer reads this) ──
     if ctx:
         ctx.overlay_data = OverlayData(
             cycle_no       = int(cycle_no),

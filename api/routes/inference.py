@@ -1,11 +1,14 @@
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from services.queue_service import inference_queue, stop_batch_inference
 from services.inference_service import get_active_video
 from database import database, models
+from crud import crud
+from utils.storage_discovery import resolve_file_location
 
 router = APIRouter(
     tags=["Inference"]
@@ -115,16 +118,22 @@ def get_inference_status(video_id: str, db: Session = Depends(database.get_db)):
 
 @router.get("/inference/{video_id}/video")
 def get_inference_video(video_id: str, db: Session = Depends(database.get_db)):
-    from fastapi.responses import FileResponse
     video = db.query(models.Video).filter(models.Video.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
     
-    # Return processed output video if available, otherwise original source video
-    if video.output_path and Path(video.output_path).is_file():
-        return FileResponse(video.output_path, media_type="video/mp4")
-    if video.source_path and Path(video.source_path).is_file():
-        return FileResponse(video.source_path, media_type="video/mp4")
+    active_storage = crud.get_active_storage(db)
+    active_root = active_storage.root_path if active_storage else None
+    
+    # 1. Return processed output video if available
+    out_file = resolve_file_location(video.output_path, active_root, Path(video.output_path).name if video.output_path else None)
+    if out_file and Path(out_file).is_file():
+        return FileResponse(out_file, media_type="video/mp4")
+
+    # 2. Return original source video if available
+    src_file = resolve_file_location(video.source_path, active_root, video.filename)
+    if src_file and Path(src_file).is_file():
+        return FileResponse(src_file, media_type="video/mp4")
         
     raise HTTPException(status_code=404, detail="Video file not found on disk")
 

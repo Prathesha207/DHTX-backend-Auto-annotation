@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from database import database, models
 from crud import crud
-from services.queue_service import inference_queue, stop_batch_inference, update_excel_log_verdict
+from services.queue_service import inference_queue, stop_batch_inference, update_excel_log_verdict, cancelled_batch_ids
 
 router = APIRouter(prefix="/batch", tags=["Batch"])
 
@@ -177,6 +177,12 @@ async def enqueue_bulk(
     active_storage = crud.get_active_storage(db)
     if not active_storage:
         raise HTTPException(status_code=500, detail="No active storage configured")
+
+    if batch_id in cancelled_batch_ids:
+        for upload in files:
+            fname = Path((upload.filename or "video.mp4").replace("\\", "/")).name
+            rejected.append(RejectedItem(filename=fname, reason="Batch upload cancelled by user"))
+        return EnqueueBulkResponse(enqueued=[], rejected=rejected)
 
     # Parse optional metadata arrays
     rel_paths: List[Optional[str]] = []
@@ -353,16 +359,16 @@ def get_batch_manifest(batch_id: str, db: Session = Depends(database.get_db)):
 def download_batch_log(batch_id: str, db: Session = Depends(database.get_db)):
     """Download the generated excel log for a batch."""
     batch = _get_batch_or_404(batch_id, db)
-    storage = batch.storage
-    if not storage:
-        raise HTTPException(status_code=500, detail="No active storage configured")
+    active_storage = crud.get_active_storage(db)
+    storage_root = Path(active_storage.root_path if active_storage else (batch.storage.root_path if batch.storage else "./storage"))
     
     batch_dir = (
-        Path(storage.root_path)
+        storage_root
         / "processed"
         / batch.batch_date
         / f"batch_{batch.batch_number}"
     )
+    batch_dir.mkdir(parents=True, exist_ok=True)
     log_path = batch_dir / "inspection_log.xlsx"
     
     if not log_path.exists():

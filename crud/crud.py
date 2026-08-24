@@ -11,11 +11,35 @@ from database import models
 # ============================================================
 
 def get_active_storage(db: Session):
-    return (
+    from utils.storage_discovery import is_path_writable, get_writable_default_location
+
+    storage = (
         db.query(models.StorageSetting)
         .filter(models.StorageSetting.is_active.is_(True))
         .first()
     )
+
+    if storage and is_path_writable(storage.root_path):
+        return storage
+
+    # Auto-heal: If no storage exists or the stored path was from a different machine
+    default_path = get_writable_default_location()
+    if storage:
+        storage.root_path = default_path
+        storage.is_active = True
+        db.commit()
+        db.refresh(storage)
+        return storage
+
+    new_setting = models.StorageSetting(
+        root_path=default_path,
+        is_active=True
+    )
+    db.add(new_setting)
+    db.commit()
+    db.refresh(new_setting)
+    return new_setting
+
 
 
 def set_active_storage(db: Session, new_root_path: str):

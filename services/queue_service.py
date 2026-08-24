@@ -15,6 +15,7 @@ INFERENCE_TIMEOUT_SECONDS = 60 * 30  # 30 minutes
 
 inference_queue = asyncio.Queue()
 cancelled_video_ids = set()
+cancelled_batch_ids = set()
 
 
 def recover_interrupted_jobs(is_shutdown: bool = False):
@@ -38,14 +39,14 @@ def recover_interrupted_jobs(is_shutdown: bool = False):
             v.processing_started_at = None
             enqueued_ids.append(v.id)
             
-            # Delete orphaned __processing__ files immediately
+            # Clean up temporary in-progress cycle files for this stuck job
             if v.batch and v.batch.storage:
                 out_base_dir = Path(v.batch.storage.root_path) / "processed" / v.batch.batch_date / f"batch_{v.batch.batch_number}"
-                video_stem = Path(v.source_path).stem
+                video_stem = Path(v.filename).stem
                 for f in out_base_dir.glob(f"__processing__{video_stem}_cycle*.mp4"):
                     try:
                         f.unlink()
-                        print(f"🧹 Cleaned up orphaned file: {f.name}")
+                        print(f"🧹 Cleaned up orphaned file on recovery: {f.name}")
                     except Exception as e:
                         print(f"⚠️ Failed to clean up {f.name}: {e}")
                         
@@ -77,8 +78,8 @@ def ensure_unknown_output(source_path: str, out_base_dir: Path, filename: str) -
         return None
 
 
-def update_excel_log_verdict(out_base_dir: Path, filename: str, verdict: str, output_path: str | None):
-    """Create or update the batch Excel log for a completed video."""
+def update_excel_log_verdict(out_base_dir: Path, filename: str, verdict: str, output_path: str | None, only_if_missing: bool = False):
+    """Create or update the batch Excel log for an aborted, failed, or fallback video."""
     try:
         import openpyxl
         from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -93,6 +94,7 @@ def update_excel_log_verdict(out_base_dir: Path, filename: str, verdict: str, ou
             "ABORTED": ("FFE0B2", "B78103"),
             "UNKNOWN": ("FFEB9C", "9C6500"),
             "FAILED": ("FFC7CE", "9C0006"),
+            "TIMEOUT": ("FFEB9C", "9C6500"),
         }
 
         if excel_path.exists():
@@ -112,20 +114,25 @@ def update_excel_log_verdict(out_base_dir: Path, filename: str, verdict: str, ou
             sheet.freeze_panes = "A2"
 
         fill_hex, text_hex = fills.get(verdict, ("F2F2F2", "000000"))
-        matched = False
-        for row in range(sheet.max_row, 1, -1):
-            if sheet.cell(row=row, column=4).value != filename:
-                continue
-            sheet.cell(row=row, column=5).value = verdict
-            sheet.cell(row=row, column=6).value = output_path or "N/A"
-            matched = True
-            status_cell = sheet.cell(row=row, column=5)
-            status_cell.fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
-            status_cell.font = Font(name="Arial", size=10, bold=True, color=text_hex)
-            break
+        
+        # Check if this filename is already in the sheet
+        matched_rows = []
+        for row in range(2, sheet.max_row + 1):
+            if sheet.cell(row=row, column=4).value == filename:
+                matched_rows.append(row)
 
-        if not matched:
-            sheet.append([sheet.max_row, datetime.datetime.now().isoformat(timespec="seconds"), 0,
+        if matched_rows:
+            if only_if_missing:
+                return
+            for row in matched_rows:
+                sheet.cell(row=row, column=5).value = verdict
+                sheet.cell(row=row, column=6).value = output_path or "N/A"
+                status_cell = sheet.cell(row=row, column=5)
+                status_cell.fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
+                status_cell.font = Font(name="Arial", size=10, bold=True, color=text_hex)
+        else:
+            sr_no = max(1, sheet.max_row)
+            sheet.append([sr_no, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0,
                           filename, verdict, output_path or "N/A"])
             status_cell = sheet.cell(row=sheet.max_row, column=5)
             status_cell.fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
@@ -164,6 +171,9 @@ def stop_batch_inference(video_id: str | None = None, batch_id: str | None = Non
 
         if not target_batch_id:
             return {"success": False, "status": "IDLE", "message": "No active batch found to stop."}
+
+        # Track that this entire batch was stopped
+        cancelled_batch_ids.add(target_batch_id)
 
         # 1. Halt active running video if it belongs to this batch
         if active_id:
@@ -219,16 +229,29 @@ async def inference_worker():
                     print(f"⚠️ Video {video_id} not found in DB.")
                     continue
 
-                if video.status in ("STOPPED", "FAILED"):
-                    print(f"⏩ Video {video_id} status is {video.status}. Skipping.")
+                if video.status in ("STOPPED", "FAILED", "ABORTED") or (video.batch_id and video.batch_id in cancelled_batch_ids):
+                    print(f"⏩ Video {video_id} status is {video.status} (or batch cancelled). Skipping.")
                     continue
                 
                 batch = video.batch
-                storage = batch.storage
+                storage = batch.storage if (batch and batch.storage) else None
+                active_storage = crud.get_active_storage(db)
+                storage_root = Path(active_storage.root_path if active_storage else (storage.root_path if storage else "./storage"))
                 
-                source_path = video.source_path
+                from utils.storage_discovery import resolve_file_location
+                resolved_src = resolve_file_location(
+                    stored_path=video.source_path,
+                    active_root=str(storage_root),
+                    filename=video.filename,
+                    subfolder=f"raw/{batch.batch_date}/batch_{batch.batch_number}" if batch else ""
+                )
+                source_path = resolved_src if (resolved_src and Path(resolved_src).is_file()) else video.source_path
+
                 # Construct the processed batch output directory
-                out_base_dir = Path(storage.root_path) / "processed" / batch.batch_date / f"batch_{batch.batch_number}"
+                if batch:
+                    out_base_dir = storage_root / "processed" / batch.batch_date / f"batch_{batch.batch_number}"
+                else:
+                    out_base_dir = storage_root / "processed" / "unknown_batch"
                 out_base_dir.mkdir(parents=True, exist_ok=True)
                 
                 # Clean up any orphaned processing temp files from previous interrupted runs
@@ -331,7 +354,7 @@ async def inference_worker():
                     for folder_name in ["UNKNOWN", "NORMAL", "ANOMALY"]:
                         sub_dir = out_base_dir / folder_name
                         if sub_dir.exists():
-                            for mp4 in sub_dir.glob("*.mp4"):
+                            for mp4 in sub_dir.glob(f"{video_stem}_*.mp4"):
                                 shutil.move(str(mp4), str(target_dest))
                                 aborted_video_path = str(target_dest.absolute())
                                 break
@@ -340,7 +363,7 @@ async def inference_worker():
 
                     # 3. Check if temporary in-progress file (__processing__*.mp4) exists
                     if not aborted_video_path:
-                        for temp_mp4 in out_base_dir.glob("*processing*.mp4"):
+                        for temp_mp4 in out_base_dir.glob(f"*processing*{video_stem}*.mp4"):
                             try:
                                 shutil.move(str(temp_mp4), str(target_dest))
                                 aborted_video_path = str(target_dest.absolute())
@@ -353,33 +376,38 @@ async def inference_worker():
                     print(f"🛑 Inference stopped for {video.filename} -> saved to: {aborted_video_path}")
                     continue
                 
-                # Phase 2: Dynamically discover the ML result and rename with verdict in filename!
-                verdict = None
-                output_path = None
+                # Phase 2: Dynamically discover the ML result for THIS specific video
                 video_stem = Path(video.filename).stem
 
-                for v in ["NORMAL", "ANOMALY", "UNKNOWN"]:
-                    v_dir = out_base_dir / v
-                    if v_dir.exists() and v_dir.is_dir():
-                        mp4s = list(v_dir.glob("*.mp4"))
-                        if mp4s:
-                            verdict = v
-                            output_path = str(mp4s[0].absolute())
-                            break
-                            
-                if not verdict or not output_path:
+                anomaly_files = list((out_base_dir / "ANOMALY").glob(f"{video_stem}_*.mp4")) if (out_base_dir / "ANOMALY").exists() else []
+                normal_files  = list((out_base_dir / "NORMAL").glob(f"{video_stem}_*.mp4")) if (out_base_dir / "NORMAL").exists() else []
+                unknown_files = list((out_base_dir / "UNKNOWN").glob(f"{video_stem}_*.mp4")) if (out_base_dir / "UNKNOWN").exists() else []
+
+                if anomaly_files:
+                    verdict = "ANOMALY"
+                    output_path = str(anomaly_files[0].absolute())
+                elif normal_files:
+                    verdict = "NORMAL"
+                    output_path = str(normal_files[0].absolute())
+                elif unknown_files:
+                    verdict = "UNKNOWN"
+                    output_path = str(unknown_files[0].absolute())
+                else:
                     verdict = "UNKNOWN"
                     output_path = ensure_unknown_output(source_path, out_base_dir, video.filename)
+                    # When ML produced 0 cycles, record the fallback UNKNOWN row in Excel
+                    update_excel_log_verdict(out_base_dir, video.filename, "UNKNOWN", output_path, only_if_missing=True)
 
                 crud.update_video_result(db, video_id, "COMPLETED", verdict, output_path)
-                update_excel_log_verdict(out_base_dir, video.filename, verdict, output_path)
                 print(f"✅ Inference finished for {video.filename} -> {verdict} ({output_path})")
 
             except Exception as e:
                 print(f"❌ Inference failed for {video_id}: {e}")
-                fallback_path = ensure_unknown_output(source_path, out_base_dir, video.filename)
+                fallback_path = None
+                if 'source_path' in locals() and 'out_base_dir' in locals() and source_path and out_base_dir and 'video' in locals() and video:
+                    fallback_path = ensure_unknown_output(source_path, out_base_dir, video.filename)
+                    update_excel_log_verdict(out_base_dir, video.filename, "UNKNOWN", fallback_path)
                 crud.update_video_result(db, video_id, "FAILED", verdict="UNKNOWN", output_path=fallback_path)
-                update_excel_log_verdict(out_base_dir, video.filename, "UNKNOWN", fallback_path)
             finally:
                 db.close()
         finally:

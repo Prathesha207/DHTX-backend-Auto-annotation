@@ -26,17 +26,23 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_db_seed():
     db = database.SessionLocal()
-    from utils.storage_discovery import get_writable_default_location
+    from utils.storage_discovery import get_writable_default_location, is_path_writable
     try:
-        setting = db.query(db_models.StorageSetting).first()
-        if not setting:
+        setting = db.query(db_models.StorageSetting).filter(db_models.StorageSetting.is_active.is_(True)).first()
+        if not setting or not is_path_writable(setting.root_path):
             default_path = get_writable_default_location()
             if default_path:
-                new_setting = db_models.StorageSetting(
-                    root_path=default_path,
-                    is_active=True
-                )
-                db.add(new_setting)
+                if setting:
+                    setting.root_path = default_path
+                    setting.is_active = True
+                    print(f"🔄 Auto-healed storage path for current machine: {default_path}")
+                else:
+                    new_setting = db_models.StorageSetting(
+                        root_path=default_path,
+                        is_active=True
+                    )
+                    db.add(new_setting)
+                    print(f"📁 Initialized storage path on current machine: {default_path}")
                 db.commit()
                 
         # Ensure default ModelSetting exists
