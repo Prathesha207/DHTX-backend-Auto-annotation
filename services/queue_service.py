@@ -337,7 +337,7 @@ async def inference_worker():
                     aborted_dir = out_base_dir / "ABORTED"
                     aborted_dir.mkdir(parents=True, exist_ok=True)
                     
-                    aborted_video_path = final_output
+                    aborted_video_path = None
                     video_stem = Path(source_path).stem
 
                     # Move any temporary in-progress file to ABORTED
